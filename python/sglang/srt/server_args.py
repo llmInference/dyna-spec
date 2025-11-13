@@ -386,6 +386,8 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
+    speculative_use_static_vocab: bool = False
+    speculative_static_vocab_ratio: float = 0.5
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -2759,6 +2761,17 @@ class ServerArgs:
             choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-use-static-vocab",
+            action="store_true",
+            help="Enable static vocabulary for the draft model.",
+        )
+        parser.add_argument(
+            "--speculative-static-vocab-ratio",
+            type=float,
+            default=ServerArgs.speculative_static_vocab_ratio,
+            help="The ratio of the vocabulary to use for the draft model.",
         )
         # Ngram speculative decoding
         parser.add_argument(

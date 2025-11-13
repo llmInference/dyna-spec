@@ -97,6 +97,8 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        use_static_vocab: bool = False,
+        static_vocab_ratio: float = 1.0,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -106,6 +108,8 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
+        requested_use_static_vocab = use_static_vocab
+        requested_static_vocab_ratio = static_vocab_ratio
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -148,6 +152,28 @@ class ModelConfig:
 
         # Config draft model
         self._config_draft_model()
+
+        # Configure static vocabulary options for draft models.
+        self.use_static_vocab = False
+        self.static_vocab_ratio = 1.0
+        self.static_vocab_size = self.hf_config.vocab_size
+        if self.is_draft_model and requested_use_static_vocab:
+            ratio = float(requested_static_vocab_ratio)
+            if not (0.0 < ratio <= 1.0):
+                logger.warning(
+                    "Invalid static vocab ratio %.4f provided. Falling back to full vocabulary.",
+                    ratio,
+                )
+                ratio = 1.0
+            static_vocab_size = max(1, int(self.hf_config.vocab_size * ratio))
+            static_vocab_size = min(static_vocab_size, self.hf_config.vocab_size)
+            if static_vocab_size < self.hf_config.vocab_size:
+                self.use_static_vocab = True
+                self.static_vocab_ratio = ratio
+                self.static_vocab_size = static_vocab_size
+        self.hf_config.use_static_vocab = self.use_static_vocab
+        self.hf_config.static_vocab_ratio = self.static_vocab_ratio
+        self.hf_config.static_vocab_size = self.static_vocab_size
 
         # Check model type
         self.attention_chunk_size = getattr(
@@ -228,6 +254,16 @@ class ModelConfig:
         model_revision: str = None,
         **kwargs,
     ):
+        if kwargs.get("is_draft_model", False):
+            kwargs.setdefault(
+                "use_static_vocab", server_args.speculative_use_static_vocab
+            )
+            kwargs.setdefault(
+                "static_vocab_ratio", server_args.speculative_static_vocab_ratio
+            )
+        else:
+            kwargs.setdefault("use_static_vocab", False)
+            kwargs.setdefault("static_vocab_ratio", 1.0)
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,

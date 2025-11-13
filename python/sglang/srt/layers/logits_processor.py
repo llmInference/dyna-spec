@@ -234,6 +234,21 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
+        self.use_static_vocab = bool(getattr(config, "use_static_vocab", False))
+        self.static_vocab_size = getattr(config, "static_vocab_size", None)
+        if self.use_static_vocab:
+            vocab_size = getattr(config, "vocab_size", None)
+            if self.static_vocab_size is None and vocab_size is not None:
+                ratio = float(getattr(config, "static_vocab_ratio", 1.0))
+                self.static_vocab_size = max(1, int(vocab_size * ratio))
+            if vocab_size is not None:
+                self.static_vocab_size = max(1, min(self.static_vocab_size, vocab_size))
+                if self.static_vocab_size >= vocab_size:
+                    self.use_static_vocab = False
+            if self.static_vocab_size is None:
+                self.use_static_vocab = False
+        else:
+            self.static_vocab_size = None
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
@@ -812,39 +827,9 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
-        if hasattr(lm_head, "weight"):
-            if self.use_fp32_lm_head:
-                logits = torch.matmul(
-                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
-                )
-            elif use_intel_amx_backend(lm_head):
-                logits = torch.ops.sgl_kernel.weight_packed_linear(
-                    hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
-                    None,  # bias
-                    True,  # is_vnni
-                )
-            elif get_global_server_args().rl_on_policy_target is not None:
-                # Due to tie-weight, we may not be able to change lm_head's weight dtype
-                logits = torch.matmul(
-                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
-                )
-            else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
-        else:
-            # GGUF models
-            # TODO: use weight_packed_linear for GGUF models
-            if self.use_fp32_lm_head:
-                with torch.cuda.amp.autocast(enabled=False):
-                    logits = lm_head.quant_method.apply(
-                        lm_head, hidden_states.to(torch.float32), embedding_bias
-                    )
-            else:
-                logits = lm_head.quant_method.apply(
-                    lm_head, hidden_states, embedding_bias
-                )
+        logits = self._project_hidden_to_vocab(
+            hidden_states, lm_head, embedding_bias
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -891,13 +876,16 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
 
-        if logits_metadata.next_token_logits_buffer is not None:
-            logits_buffer = logits_metadata.next_token_logits_buffer
-            assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.config.vocab_size])
-            logits = logits_buffer
+        if self.use_static_vocab:
+            logits = logits[:, : self.static_vocab_size].float()
         else:
-            logits = logits[:, : self.config.vocab_size].float()
+            if logits_metadata.next_token_logits_buffer is not None:
+                logits_buffer = logits_metadata.next_token_logits_buffer
+                assert logits_buffer.dtype == torch.float
+                logits_buffer.copy_(logits[:, : self.config.vocab_size])
+                logits = logits_buffer
+            else:
+                logits = logits[:, : self.config.vocab_size].float()
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -908,6 +896,78 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _project_hidden_to_vocab(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.use_static_vocab and isinstance(lm_head, VocabParallelEmbedding):
+            return self._matmul_static_vocab_parallel(hidden_states, lm_head)
+
+        if hasattr(lm_head, "weight"):
+            if self.use_fp32_lm_head:
+                return torch.matmul(
+                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                )
+            if use_intel_amx_backend(lm_head):
+                return torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight,
+                    None,
+                    True,
+                )
+            if get_global_server_args().rl_on_policy_target is not None:
+                return torch.matmul(
+                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                )
+            return torch.matmul(
+                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+            )
+
+        if self.use_fp32_lm_head:
+            with torch.cuda.amp.autocast(enabled=False):
+                return lm_head.quant_method.apply(
+                    lm_head, hidden_states.to(torch.float32), embedding_bias
+                )
+        return lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
+
+    def _matmul_static_vocab_parallel(
+        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> torch.Tensor:
+        assert (
+            self.static_vocab_size is not None
+        ), "Static vocabulary size must be defined when static vocab is enabled."
+
+        shard = lm_head.shard_indices
+        partition_size = lm_head.num_embeddings_per_partition
+        proj_dtype = torch.float32 if self.use_fp32_lm_head else lm_head.weight.dtype
+        hidden_proj = hidden_states.to(proj_dtype)
+
+        fill_value = torch.finfo(proj_dtype).min
+        local_logits = torch.full(
+            (hidden_states.shape[0], partition_size),
+            fill_value,
+            dtype=proj_dtype,
+            device=hidden_states.device,
+        )
+
+        local_start = shard.org_vocab_start_index
+        local_end = shard.org_vocab_end_index
+        active_end = min(self.static_vocab_size, local_end)
+        local_active = max(0, active_end - local_start)
+
+        if local_active > 0:
+            base_rows = lm_head.num_org_embeddings_per_partition
+            weight_base = lm_head.weight[:base_rows]
+            weight_slice = weight_base[:local_active]
+            if self.use_fp32_lm_head:
+                weight_slice = weight_slice.to(proj_dtype)
+            logits_slice = torch.matmul(hidden_proj, weight_slice.T)
+            local_logits[:, :local_active] = logits_slice
+
+        return local_logits.to(hidden_states.dtype)
 
     @staticmethod
     def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):

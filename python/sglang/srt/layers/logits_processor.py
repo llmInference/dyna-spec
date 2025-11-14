@@ -69,6 +69,8 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
+    # Mapping from static vocabulary indices back to the original token ids, if static vocab is active.
+    static_vocab_token_ids: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -194,7 +196,6 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
@@ -235,20 +236,72 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.logit_scale = logit_scale
         self.use_static_vocab = bool(getattr(config, "use_static_vocab", False))
-        self.static_vocab_size = getattr(config, "static_vocab_size", None)
+        self.static_vocab_size: Optional[int] = None
+        self._static_vocab_indices_list: List[int] = []
+        self._static_vocab_index_map: dict[int, int] = {}
+
+        static_indices_tensor = torch.empty(0, dtype=torch.long)
         if self.use_static_vocab:
             vocab_size = getattr(config, "vocab_size", None)
-            if self.static_vocab_size is None and vocab_size is not None:
-                ratio = float(getattr(config, "static_vocab_ratio", 1.0))
-                self.static_vocab_size = max(1, int(vocab_size * ratio))
-            if vocab_size is not None:
-                self.static_vocab_size = max(1, min(self.static_vocab_size, vocab_size))
-                if self.static_vocab_size >= vocab_size:
-                    self.use_static_vocab = False
-            if self.static_vocab_size is None:
+            indices_source = getattr(config, "static_vocab_indices", None)
+            indices_list: List[int]
+            if indices_source is not None:
+                if isinstance(indices_source, torch.Tensor):
+                    indices_iter = indices_source.tolist()
+                else:
+                    indices_iter = indices_source
+                indices_list = [int(idx) for idx in indices_iter]
+            else:
+                target_size = getattr(config, "static_vocab_size", None)
+                if target_size is None and vocab_size is not None:
+                    ratio = float(getattr(config, "static_vocab_ratio", 1.0))
+                    target_size = max(1, int(vocab_size * ratio))
+                target_size = int(target_size) if target_size is not None else 0
+                indices_list = list(range(max(0, target_size)))
+
+            if vocab_size is not None and len(indices_list) >= int(vocab_size):
                 self.use_static_vocab = False
-        else:
+            elif len(indices_list) == 0:
+                self.use_static_vocab = False
+            else:
+                self._static_vocab_indices_list = indices_list
+                self.static_vocab_size = len(indices_list)
+                static_indices_tensor = torch.tensor(
+                    self._static_vocab_indices_list, dtype=torch.long
+                )
+                self._static_vocab_index_map = {
+                    token_id: idx
+                    for idx, token_id in enumerate(self._static_vocab_indices_list)
+                }
+
+        if not self.use_static_vocab:
             self.static_vocab_size = None
+
+        self.register_buffer(
+            "_static_vocab_indices", static_indices_tensor, persistent=False
+        )
+        self._static_vocab_indices_host = static_indices_tensor.cpu()
+        self._active_static_indices: Optional[torch.Tensor] = None
+        self._static_vocab_indices_cache: dict[torch.device, torch.Tensor] = {}
+        self._static_partition_relative_cache: dict[
+            tuple[torch.device, int, int], torch.Tensor
+        ] = {}
+        if static_indices_tensor.numel() > 0:
+            self._static_vocab_indices_cache[static_indices_tensor.device] = (
+                static_indices_tensor
+            )
+        if (
+            self.use_static_vocab
+            and static_indices_tensor.numel() > 0
+            and torch.cuda.is_available()
+        ):
+            default_device = torch.device("cuda", torch.cuda.current_device())
+            if static_indices_tensor.device == default_device:
+                self._static_vocab_indices_cache[default_device] = static_indices_tensor
+            else:
+                self._static_vocab_indices_cache[default_device] = (
+                    static_indices_tensor.to(default_device)
+                )
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
@@ -545,6 +598,7 @@ class LogitsProcessor(nn.Module):
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
+                static_vocab_token_ids=self._active_static_indices,
                 hidden_states=hidden_states_to_store,
             )
 
@@ -601,6 +655,7 @@ class LogitsProcessor(nn.Module):
 
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
+            static_vocab_token_ids=self._active_static_indices,
             hidden_states=hidden_states_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
@@ -827,9 +882,7 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
-        logits = self._project_hidden_to_vocab(
-            hidden_states, lm_head, embedding_bias
-        )
+        logits = self._project_hidden_to_vocab(hidden_states, lm_head, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -876,9 +929,12 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
 
-        if self.use_static_vocab:
-            logits = logits[:, : self.static_vocab_size].float()
+        if self.use_static_vocab and self.static_vocab_size:
+            static_indices = self._get_static_indices_for_device(logits.device)
+            logits = torch.index_select(logits, dim=1, index=static_indices).float()
+            self._active_static_indices = static_indices
         else:
+            self._active_static_indices = None
             if logits_metadata.next_token_logits_buffer is not None:
                 logits_buffer = logits_metadata.next_token_logits_buffer
                 assert logits_buffer.dtype == torch.float
@@ -896,6 +952,67 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _get_static_indices_for_device(self, device: torch.device) -> torch.Tensor:
+        if not self.use_static_vocab or self.static_vocab_size is None:
+            raise RuntimeError(
+                "Static vocabulary is not enabled for this logits processor."
+            )
+
+        device = torch.device(device)
+        cached = self._static_vocab_indices_cache.get(device)
+        if cached is not None:
+            return cached
+
+        base = self._static_vocab_indices
+        if base.device != device:
+            if (
+                device.type == "cuda"
+                and torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError(
+                    "Static vocab indices are not cached for device during CUDA graph capture. "
+                    "Call a warmup forward pass before enabling capture to pre-materialize the indices."
+                )
+            cached = base.to(device)
+        else:
+            cached = base
+
+        self._static_vocab_indices_cache[device] = cached
+        return cached
+
+    def _get_partition_static_relative_indices(
+        self, device: torch.device, local_start: int, local_end: int
+    ) -> torch.Tensor:
+        if not self.use_static_vocab or self.static_vocab_size is None:
+            raise RuntimeError(
+                "Static vocabulary is not enabled for this logits processor."
+            )
+
+        host_key = (torch.device("cpu"), local_start, local_end)
+        host_cached = self._static_partition_relative_cache.get(host_key)
+        if host_cached is None:
+            base_cpu = self._static_vocab_indices_host
+            if base_cpu.numel() == 0:
+                host_cached = base_cpu
+            else:
+                mask_cpu = (base_cpu >= local_start) & (base_cpu < local_end)
+                host_cached = (base_cpu[mask_cpu] - local_start).to(torch.long)
+            self._static_partition_relative_cache[host_key] = host_cached
+
+        target_device = torch.device(device)
+        if target_device.type == "cpu":
+            return host_cached.to(target_device)
+
+        cache_key = (target_device, local_start, local_end)
+        cached = self._static_partition_relative_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        cached = host_cached.to(target_device)
+        self._static_partition_relative_cache[cache_key] = cached
+        return cached
 
     def _project_hidden_to_vocab(
         self,
@@ -955,23 +1072,32 @@ class LogitsProcessor(nn.Module):
 
         local_start = shard.org_vocab_start_index
         local_end = shard.org_vocab_end_index
-        active_end = min(self.static_vocab_size, local_end)
-        local_active = max(0, active_end - local_start)
+        local_relative_indices = self._get_partition_static_relative_indices(
+            hidden_states.device, local_start, local_end
+        )
 
-        if local_active > 0:
-            base_rows = lm_head.num_org_embeddings_per_partition
-            weight_base = lm_head.weight[:base_rows]
-            weight_slice = weight_base[:local_active]
-            if self.use_fp32_lm_head:
-                weight_slice = weight_slice.to(proj_dtype)
-            logits_slice = torch.matmul(hidden_proj, weight_slice.T)
-            local_logits[:, :local_active] = logits_slice
+        if local_relative_indices.numel() == 0:
+            return local_logits.to(hidden_states.dtype)
+
+        base_rows = lm_head.num_org_embeddings_per_partition
+        weight_base = lm_head.weight[:base_rows]
+        gather_indices = local_relative_indices.to(weight_base.device)
+        weight_slice = torch.index_select(weight_base, 0, gather_indices)
+        if self.use_fp32_lm_head:
+            weight_slice = weight_slice.to(proj_dtype)
+        logits_slice = torch.matmul(hidden_proj, weight_slice.T)
+        local_logits.index_copy_(1, gather_indices, logits_slice)
 
         return local_logits.to(hidden_states.dtype)
 
-    @staticmethod
-    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
-        max_k = max(logits_metadata.top_logprobs_nums)
+    def get_top_logprobs(
+        self, all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
+    ):
+        max_k = (
+            max(logits_metadata.top_logprobs_nums)
+            if logits_metadata.top_logprobs_nums
+            else 0
+        )
         ret = all_logprobs.topk(max_k, dim=1)
         values = ret.values.tolist()
         indices = ret.indices.tolist()
@@ -988,18 +1114,21 @@ class LogitsProcessor(nn.Module):
                 input_top_logprobs_idx.append([])
                 continue
 
-            input_top_logprobs_val.append(
-                [values[pt + j][:k] for j in range(pruned_len)]
-            )
-            input_top_logprobs_idx.append(
-                [indices[pt + j][:k] for j in range(pruned_len)]
-            )
+            seq_val = [values[pt + j][:k] for j in range(pruned_len)]
+            seq_idx = [indices[pt + j][:k] for j in range(pruned_len)]
+            if self.use_static_vocab and self._static_vocab_indices_list:
+                seq_idx = [
+                    [self._static_vocab_indices_list[idx] for idx in row]
+                    for row in seq_idx
+                ]
+            input_top_logprobs_val.append(seq_val)
+            input_top_logprobs_idx.append(seq_idx)
             pt += pruned_len
 
         return input_top_logprobs_val, input_top_logprobs_idx
 
-    @staticmethod
     def get_top_logprobs_chunk(
+        self,
         logprobs: torch.Tensor,
         logits_metadata: LogitsMetadata,
         top_k_nums: List[int],
@@ -1026,7 +1155,11 @@ class LogitsProcessor(nn.Module):
         if logprobs.shape[0] == 0:
             return 0
 
-        max_k = max(logits_metadata.top_logprobs_nums)
+        max_k = (
+            max(logits_metadata.top_logprobs_nums)
+            if logits_metadata.top_logprobs_nums
+            else 0
+        )
         ret = logprobs.topk(max_k, dim=1)
         values = ret.values.tolist()
         indices = ret.indices.tolist()
@@ -1062,6 +1195,11 @@ class LogitsProcessor(nn.Module):
 
             # Append or extend based on whether the sequence was split across chunks
             if len(val) > 0:
+                if self.use_static_vocab and self._static_vocab_indices_list:
+                    idx = [
+                        [self._static_vocab_indices_list[pos] for pos in row]
+                        for row in idx
+                    ]
                 if split_pruned_len > 0:
                     input_top_logprobs_val[-1].extend(val)
                     input_top_logprobs_idx[-1].extend(idx)
@@ -1072,8 +1210,49 @@ class LogitsProcessor(nn.Module):
             pt += pruned_len
         return next_split_pruned_len
 
-    @staticmethod
+    def _gather_token_logprobs_matrix(
+        self, logprobs: torch.Tensor, token_ids: Optional[List[int]]
+    ) -> torch.Tensor:
+        num_positions = logprobs.shape[0]
+        tokens = list(token_ids) if token_ids else []
+        if not tokens:
+            return torch.empty(
+                (num_positions, 0),
+                dtype=logprobs.dtype,
+                device=logprobs.device,
+            )
+
+        if not self.use_static_vocab:
+            return logprobs[:, tokens]
+
+        fill_value = torch.finfo(logprobs.dtype).min
+        result = torch.full(
+            (num_positions, len(tokens)),
+            fill_value,
+            dtype=logprobs.dtype,
+            device=logprobs.device,
+        )
+        mapping = [self._static_vocab_index_map.get(int(tok)) for tok in tokens]
+        valid = [
+            (col_idx, mapped)
+            for col_idx, mapped in enumerate(mapping)
+            if mapped is not None
+        ]
+        if not valid:
+            return result
+
+        gather_indices = torch.tensor(
+            [mapped for _, mapped in valid],
+            device=logprobs.device,
+            dtype=torch.long,
+        )
+        gathered = logprobs.index_select(1, gather_indices)
+        for offset, (col_idx, _) in enumerate(valid):
+            result[:, col_idx] = gathered[:, offset]
+        return result
+
     def get_token_ids_logprobs(
+        self,
         all_logprobs: torch.Tensor,
         logits_metadata: LogitsMetadata,
         delay_cpu_copy: bool = False,
@@ -1084,29 +1263,29 @@ class LogitsProcessor(nn.Module):
             logits_metadata.token_ids_logprobs,
             logits_metadata.extend_logprob_pruned_lens_cpu,
         ):
+            tokens = list(token_ids) if token_ids is not None else []
             if pruned_len <= 0:
                 input_token_ids_logprobs_val.append([])
                 input_token_ids_logprobs_idx.append([])
                 continue
 
-            position_logprobs = all_logprobs[
-                pt : pt + pruned_len, token_ids
-            ]  # Shape: [pruned_len, num_tokens]
+            span = all_logprobs[pt : pt + pruned_len]
+            position_logprobs = self._gather_token_logprobs_matrix(span, tokens)
 
             if delay_cpu_copy:
-                # Keep as tensor to delay GPU-to-CPU transfer
                 input_token_ids_logprobs_val.append(position_logprobs)
             else:
-                # Convert to list immediately (default behavior)
                 input_token_ids_logprobs_val.append(position_logprobs.tolist())
 
-            input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
+            input_token_ids_logprobs_idx.append(
+                [list(tokens) for _ in range(pruned_len)]
+            )
             pt += pruned_len
 
         return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
 
-    @staticmethod
     def get_token_ids_logprobs_chunk(
+        self,
         logprobs: torch.Tensor,
         logits_metadata: LogitsMetadata,
         token_ids_logprobs: List[int],
@@ -1148,26 +1327,24 @@ class LogitsProcessor(nn.Module):
             else:
                 split_pruned_len = 0
 
+            tokens = list(token_ids) if token_ids is not None else []
+
             if pruned_len <= 0:
-                # if pruned length is less than or equal to 0,
-                # there is no token ids logprobs to process
                 input_token_ids_logprobs_val.append([])
                 input_token_ids_logprobs_idx.append([])
                 continue
 
-            # Get the token ids logprobs
-            val = []
-            idx = []
-            for j in range(pruned_len):
-                # Handle remaining tokens in next chunk if any
-                if pt + j >= logprobs.shape[0]:
-                    next_split_pruned_len = split_pruned_len + j
-                    break
-                if token_ids is not None:
-                    val.append(logprobs[pt + j, token_ids].tolist())
-                    idx.append(token_ids)
+            available_rows = max(0, min(pruned_len, logprobs.shape[0] - pt))
+            if available_rows == 0:
+                next_split_pruned_len = pruned_len
+                pt += pruned_len
+                continue
 
-            # Append or extend based on whether the sequence was split across chunks
+            slice_logprobs = logprobs[pt : pt + available_rows]
+            gathered = self._gather_token_logprobs_matrix(slice_logprobs, tokens)
+            val = gathered.tolist()
+            idx = [list(tokens) for _ in range(available_rows)]
+
             if len(val) > 0:
                 if split_pruned_len > 0:
                     input_token_ids_logprobs_val[-1].extend(val)
@@ -1175,6 +1352,9 @@ class LogitsProcessor(nn.Module):
                 else:
                     input_token_ids_logprobs_val.append(val)
                     input_token_ids_logprobs_idx.append(idx)
+
+            if available_rows < pruned_len:
+                next_split_pruned_len = pruned_len - available_rows
 
             pt += pruned_len
         return next_split_pruned_len

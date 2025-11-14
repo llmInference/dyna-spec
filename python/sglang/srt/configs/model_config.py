@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import Any, List, Optional, Set, Union
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -99,6 +99,7 @@ class ModelConfig:
         quantize_and_serve: bool = False,
         use_static_vocab: bool = False,
         static_vocab_ratio: float = 1.0,
+        custom_vocab_path: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -108,6 +109,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
+        self.custom_vocab_path = custom_vocab_path
         requested_use_static_vocab = use_static_vocab
         requested_static_vocab_ratio = static_vocab_ratio
 
@@ -156,24 +158,60 @@ class ModelConfig:
         # Configure static vocabulary options for draft models.
         self.use_static_vocab = False
         self.static_vocab_ratio = 1.0
-        self.static_vocab_size = self.hf_config.vocab_size
+        self.static_vocab_size = int(self.hf_config.vocab_size)
+        self.static_vocab_indices: Optional[List[int]] = None
+        self.static_vocab_path: Optional[str] = None
         if self.is_draft_model and requested_use_static_vocab:
+            vocab_size = int(self.hf_config.vocab_size)
             ratio = float(requested_static_vocab_ratio)
-            if not (0.0 < ratio <= 1.0):
-                logger.warning(
-                    "Invalid static vocab ratio %.4f provided. Falling back to full vocabulary.",
-                    ratio,
+            indices: Optional[List[int]] = None
+
+            if self.custom_vocab_path:
+                indices, resolved_path = self._load_static_vocab_from_file(
+                    self.custom_vocab_path, vocab_size
                 )
-                ratio = 1.0
-            static_vocab_size = max(1, int(self.hf_config.vocab_size * ratio))
-            static_vocab_size = min(static_vocab_size, self.hf_config.vocab_size)
-            if static_vocab_size < self.hf_config.vocab_size:
-                self.use_static_vocab = True
-                self.static_vocab_ratio = ratio
-                self.static_vocab_size = static_vocab_size
+                if indices:
+                    if len(indices) >= vocab_size:
+                        logger.warning(
+                            "Custom static vocab file %s includes %d tokens, which does not reduce the vocabulary. Falling back to full vocabulary.",
+                            resolved_path,
+                            len(indices),
+                        )
+                    else:
+                        self.use_static_vocab = True
+                        self.static_vocab_indices = indices
+                        self.static_vocab_size = len(indices)
+                        self.static_vocab_ratio = self.static_vocab_size / vocab_size
+                        self.static_vocab_path = resolved_path
+                else:
+                    logger.warning(
+                        "Failed to load a usable custom static vocab from %s. Falling back to ratio %.4f.",
+                        self.custom_vocab_path,
+                        ratio,
+                    )
+
+            if not self.use_static_vocab:
+                if not (0.0 < ratio <= 1.0):
+                    logger.warning(
+                        "Invalid static vocab ratio %.4f provided. Falling back to full vocabulary.",
+                        ratio,
+                    )
+                    ratio = 1.0
+                static_vocab_size = max(1, int(vocab_size * ratio))
+                static_vocab_size = min(static_vocab_size, vocab_size)
+                if static_vocab_size < vocab_size:
+                    self.use_static_vocab = True
+                    self.static_vocab_size = static_vocab_size
+                    self.static_vocab_ratio = self.static_vocab_size / vocab_size
+                    self.static_vocab_indices = list(range(self.static_vocab_size))
+
         self.hf_config.use_static_vocab = self.use_static_vocab
         self.hf_config.static_vocab_ratio = self.static_vocab_ratio
         self.hf_config.static_vocab_size = self.static_vocab_size
+        self.hf_config.static_vocab_indices = (
+            self.static_vocab_indices if self.use_static_vocab else None
+        )
+        self.hf_config.static_vocab_path = self.static_vocab_path
 
         # Check model type
         self.attention_chunk_size = getattr(
@@ -261,9 +299,13 @@ class ModelConfig:
             kwargs.setdefault(
                 "static_vocab_ratio", server_args.speculative_static_vocab_ratio
             )
+            kwargs.setdefault(
+                "custom_vocab_path", server_args.speculative_static_vocab_path
+            )
         else:
             kwargs.setdefault("use_static_vocab", False)
             kwargs.setdefault("static_vocab_ratio", 1.0)
+            kwargs.setdefault("custom_vocab_path", None)
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -281,6 +323,95 @@ class ModelConfig:
             override_config_file=server_args.decrypted_config_file,
             **kwargs,
         )
+
+    def _resolve_static_vocab_path(self, path: str) -> Optional[str]:
+        expanded = os.path.expanduser(path)
+        candidates = [expanded]
+        if not os.path.isabs(expanded):
+            candidates.append(os.path.abspath(expanded))
+            if os.path.isdir(self.model_path):
+                candidates.append(os.path.join(self.model_path, expanded))
+
+        seen: Set[str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+        return None
+
+    def _load_static_vocab_from_file(
+        self, path: str, vocab_size: int
+    ) -> Tuple[Optional[List[int]], Optional[str]]:
+        resolved_path = self._resolve_static_vocab_path(path)
+        if resolved_path is None:
+            logger.warning(
+                "Static vocab file %s could not be found (cwd %s).",
+                path,
+                os.getcwd(),
+            )
+            return None, None
+
+        indices: List[int] = []
+        seen_tokens: Set[int] = set()
+        invalid_count = 0
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                try:
+                    token_id = int(stripped)
+                except ValueError:
+                    invalid_count += 1
+                    logger.warning(
+                        "Ignoring non-integer token id '%s' at line %d in %s.",
+                        stripped,
+                        line_no,
+                        resolved_path,
+                    )
+                    continue
+
+                if token_id < 0 or token_id >= vocab_size:
+                    invalid_count += 1
+                    logger.warning(
+                        "Ignoring out-of-range token id %d at line %d in %s (expected 0 <= id < %d).",
+                        token_id,
+                        line_no,
+                        resolved_path,
+                        vocab_size,
+                    )
+                    continue
+
+                if token_id in seen_tokens:
+                    continue
+
+                seen_tokens.add(token_id)
+                indices.append(token_id)
+
+        if not indices:
+            logger.warning(
+                "Static vocab file %s did not yield any valid token ids.",
+                resolved_path,
+            )
+            return None, resolved_path
+
+        if invalid_count > 0:
+            logger.info(
+                "Loaded %d static vocab tokens from %s with %d invalid lines omitted.",
+                len(indices),
+                resolved_path,
+                invalid_count,
+            )
+        else:
+            logger.info(
+                "Loaded %d static vocab tokens from %s.",
+                len(indices),
+                resolved_path,
+            )
+
+        return indices, resolved_path
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model

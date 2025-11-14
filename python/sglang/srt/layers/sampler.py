@@ -187,6 +187,11 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
+        mapping = logits_output.static_vocab_token_ids
+        if mapping is not None:
+            mapped_ids = mapping[batch_next_token_ids]
+            batch_next_token_ids = mapped_ids.to(batch_next_token_ids.dtype)
+
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:

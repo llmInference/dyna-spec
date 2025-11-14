@@ -388,6 +388,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_use_static_vocab: bool = False
     speculative_static_vocab_ratio: float = 0.5
+    speculative_static_vocab_path: Optional[str] = None
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -1578,10 +1579,15 @@ class ServerArgs:
                 or self.decode_attention_backend == "trtllm_mha"
                 or self.prefill_attention_backend == "trtllm_mha"
             ):
+                if self.speculative_eagle_topk is None:
+                    self.speculative_eagle_topk = 1
                 if self.speculative_eagle_topk > 1:
                     raise ValueError(
                         "trtllm_mha backend only supports topk = 1 for speculative decoding."
                     )
+
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
 
             if (
                 self.speculative_eagle_topk == 1
@@ -2772,6 +2778,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.speculative_static_vocab_ratio,
             help="The ratio of the vocabulary to use for the draft model.",
+        )
+        parser.add_argument(
+            "--speculative-static-vocab-path",
+            type=str,
+            default=ServerArgs.speculative_static_vocab_path,
+            help="Optional path to a newline-delimited list of token IDs to serve as the draft model's static vocabulary subset. Overrides the ratio when provided.",
         )
         # Ngram speculative decoding
         parser.add_argument(

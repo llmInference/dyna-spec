@@ -36,7 +36,7 @@ SGlang 作为一个高性能的推理框架，支持推测解码（Speculative D
 class ModelConfig:
     # ... 现有参数 ...
     vocab_size: int
-    
+
     # --- 新增参数 ---
     # 是否为草稿模型启用静态词汇表优化
     use_static_vocab: bool = False
@@ -61,7 +61,7 @@ class LlamaForCausalLM(nn.Module):
         self.config = config
         # ... 其他初始化 ...
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
+
         # --- 新增：初始化静态词汇表索引 ---
         self.static_vocab_indices = None
         if config.use_static_vocab and 0.0 < config.static_vocab_ratio <= 1.0:
@@ -78,17 +78,17 @@ class LlamaForCausalLM(nn.Module):
             # 1. 从原始 lm_head 权重中仅选择静态词汇表对应的部分
             #    注意：为了效率，此操作应在模型初始化时完成一次，或使用高效的索引操作
             active_lm_head_weight = self.lm_head.weight.index_select(0, self.static_vocab_indices)
-            
+
             # 2. 在裁剪后的词汇表子集上计算 Logits
             logits = torch.matmul(hidden_states, active_lm_head_weight.t())
-            
+
             # 3. (重要) Softmax 和采样将在此缩减的 Logits 上进行。
             #    后续的采样步骤需要知道原始的 token_id，因此需要将采样出的索引映射回原始词汇表 ID。
             #    例如：sampled_index -> self.static_vocab_indices[sampled_index]
         else:
             # 原始逻辑：在完整词汇表上计算 Logits
             logits = self.lm_head(hidden_states)
-            
+
         return logits, ...
 ```
 
@@ -99,7 +99,213 @@ class LlamaForCausalLM(nn.Module):
 
 ---
 
-##### **第二阶段：支持自定义静态词汇表**
+
+##### **附加需求：基于 OpenWebText 语料按出现率生成静态词汇表（新增）**
+
+为方便批量构建并复用高频词元集合，我们新增一项明确需求：提供一个独立的工具（或脚本），用于从 OpenWebText 数据集中按 token 出现频率，生成给定大小 k 的静态词汇表文件（模型 token id，按频率从高到低排序，每行一个整数）。该文件可直接作为 `--speculative-static-vocab-path` / `custom_vocab_path` 的输入。
+
+合同（Contract）
+- 输入：
+    - OpenWebText 数据集标识或 manifest（HuggingFace ID `openwebtext`，或可流式读取的本地切片）。
+    - 模型分词器（tokenizer）的路径或名称（用于将文本分词并获得 token id）。
+    - 目标词表大小 k（正整数，表示输出前 k 个最频繁的 token id）。
+    - 输出路径（plain text 文件），每行包含一个 token id。
+    - 可选参数：批次大小（用以控制 tokenizer 的批处理）、是否跳过注释/特殊标记、忽略超出模型 vocab_size 的 id、并发 worker 数等。
+
+- 输出：
+    - 一个文本文件（例如 `/tmp/custom_static_vocab.txt`），包含最多 k 个不同的 token id；先按在语料中出现频率选出 top-k（去重），然后将这 k 个 token id 按数值升序排序并写入文件（每行一个整数，不带其它注释）。
+
+文件格式与约定
+- 文件为 UTF-8 编码的纯文本，每行仅包含一个非负整数，代表模型词汇表中的 token id；例如：
+
+```
+3
+17
+502
+...
+```
+
+- 如果语料中出现的某些 token id 超出模型 `vocab_size` 范围（例如 token_id >= vocab_size 或 token_id < 0），这些行应被忽略并记录为警告。
+- 若语料中不同文本映射到相同 token id（正常情况），计数应合并到该 token id 的总频次中。
+- 若语料中有效 token id 总数小于 k，则输出所有可用 token id（按频率排序）。
+
+实现要点（建议）
+    - 使用模型对应的 HuggingFace tokenizer（或等效的 tokenizer API）将文本分割为 token ids。例如：
+        - 调用 tokenizer.encode / tokenizer.__call__（注意设置 return_tensors=None，禁用添加 BOS/EOS，视情况关闭 truncation）。
+        - 为避免内存峰值，使用 HuggingFace streaming API 与分批（batch）分词；对大型语料（如 OpenWebText）建议逐文件、逐行或按固定字节块分割处理。
+- 采用高效计数器（例如 Python 的 collections.Counter 或 numpy 聚合）来统计每个 token id 的出现次数；计数过程中跳过非整数或超出范围的 token id。
+- 最后基于计数器选择前 k 个 token id（按出现次数降序），若出现次数相同，可按 token id 升序作为次级排序保证确定性。
+- 输出时写入临时文件并 atomic rename，避免中途失败导致不完整文件。
+
+CLI 示例（建议）
+
+```
+python reducedVocab/stream_slimpajama_vocab.py \
+    --dataset openwebtext \
+    --tokenizer Qwen/Qwen3-4B \
+    --freq-output /tmp/token_freq.txt \
+    --vocab-output /tmp/custom_static_vocab.txt \
+    --topk 32000 \
+    --batch-size 8192 \
+    --checkpoint /tmp/openwebtext_counter.pkl
+```
+
+最小示例（核心步骤）
+
+```python
+from collections import Counter
+from transformers import AutoTokenizer
+import os
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B", use_fast=True)
+counter = Counter()
+
+def process_text(text):
+        ids = tokenizer(text, add_special_tokens=False).input_ids
+        counter.update(ids)
+
+# 对大语料，请以流式方式调用 process_text
+
+# 取 top-k（按频率），再按 token id 升序写出
+top_k = [tid for tid, _ in counter.most_common(k)]
+# 过滤掉越界 id 并去重（most_common 已按 id 合并计数），然后按数值排序
+filtered = [tid for tid in top_k if 0 <= tid < tokenizer.vocab_size]
+filtered_sorted = sorted(filtered)
+with open("/tmp/custom_static_vocab.txt.tmp", "w", encoding="utf-8") as f:
+    for tid in filtered_sorted:
+        f.write(f"{tid}\n")
+os.replace("/tmp/custom_static_vocab.txt.tmp", "/tmp/custom_static_vocab.txt")
+
+# 如果你已经有一个按频率输出的文件，可以用系统工具数值排序：
+# sort -n /tmp/custom_static_vocab.txt -o /tmp/custom_static_vocab.sorted.txt
+```
+
+注意与兼容性
+- 确保 tokenizer 与目标模型使用相同的 vocab / tokenizer 配置（tokenizer.vocab_size 与模型的 `vocab_size` 一致）以避免 id 对应错误。
+- 如果需要对多模型支持，允许传入模型 `vocab_size` 参数以便在写入时进行边界检查。
+- 对于多文件和超大语料，建议支持分布式或并行处理以加速统计。
+
+用途
+- 生成的文件可直接作为 `--speculative-static-vocab-path` 或模型配置中的 `custom_vocab_path` 传入，从而在草稿模型中启用词汇表裁剪，显著减少 LM head 的计算量并提高草稿模型速度。
+
+###### **流式下载 & 分片统计 (进一步约束)**
+
+考虑到 OpenWebText 数据集体量仍然很大（数百 GB 级），一次性下载再处理并不现实。我们要求工具支持“边下载、边分词、边计数”的流式模式，流程如下：
+
+1. **输入**：
+   - HuggingFace 公开数据集 `openwebtext`（支持 `datasets.load_dataset(..., streaming=True)`），或者你预先复制到本地的切片目录。
+   - 草稿模型的分词器（与主模型保持一致）。
+   - 可配置的批次大小 / tokenizer 并发，以及 shard 参数（如 `--shard-total`）以并行处理多个流。
+   - 目标输出：
+       - ① 原始频次文件 `token_freq.txt`（按出现频率降序列出 `token_id	count`）。
+       - ② 静态词汇表 `custom_static_vocab.txt`（在频次表基础上取前 k 个 token id，再按数值升序写入，每行一个 id）。
+
+2. **处理循环（伪流程）**：
+
+```
+dataset = datasets.load_dataset("openwebtext", split="train", streaming=True)
+if shard_total > 1:
+    dataset = dataset.shard(num_shards=shard_total, index=shard_index)
+for batch in chunk_stream(dataset, batch_size):
+    token_ids = tokenizer(batch, add_special_tokens=False)["input_ids"]
+    counter.update(flatten(token_ids))
+    maybe_checkpoint(counter)
+```
+
+3. **中间状态与容错**：
+   - 计数器可每处理 N 行就持久化（例如写入 `counts.tmp.pkl`），以便失败后恢复。
+   - 支持断点恢复：记录 `--checkpoint` 的路径并保留已完成的 shard index，重新启动时可以跳过已完成的 shard。
+
+4. **输出阶段**：
+   - `token_freq.txt`: 记录 `Counter.most_common()` 的结果；若文件过大，可直接写出 `token_id	count` 并按 count 降序。
+   - `custom_static_vocab.txt`: 读取频次文件、取前 k 个、过滤越界 id、按 token id 升序输出（同前述要求）。
+   - 可选再提供 `sort -n` 或 `python -c "..."` 等方式方便二次排序。
+
+5. **CLI 示例**：
+
+```
+python reducedVocab/stream_slimpajama_vocab.py \
+  --dataset openwebtext \
+  --tokenizer Qwen/Qwen3-4B \
+  --shard-total 4 \
+  --topk 32000 \
+  --freq-output /tmp/token_freq.txt \
+  --vocab-output /tmp/custom_static_vocab.txt \
+  --checkpoint /tmp/openwebtext_counter.chkpt
+```
+
+这样我们无需一次性下载完整语料，只需保证网络带宽可持续即可。统计结果（频次表 + 排序后的静态词表）可直接复用在草稿模型的静态词汇功能中。
+
+
+###### **领域语料 Accept Rate 评测（新增）**
+
+除 SlimPajama 外，还需要对**指定的某一份领域语料**（例如医学报告合集）直接做截断补全实验。具体做法：对这份语料里的每一条记录，只截取其中固定比例（默认 50%）作为 prompt，剩余部分作为参考答案；在不额外扩充或打乱语料的前提下，使用启用静态词表的草稿模型执行补写，并统计推测解码 `accept_rate`（可来自 SGLang 日志或 metrics 导出）。
+
+**合同（Contract）**
+- 输入：
+    - 领域语料文件：推荐 JSONL/CSV/纯文本格式，需包含 `text` 字段（可扩展为多字段）。
+    - `truncate_ratio`：截断比例，默认 0.5，表示前半段作为提示，后半段作为 ground truth。
+    - 草稿模型/主模型配置（含静态词表文件）。
+    - 可选：采样条数、最大生成长度、请求并发度等。
+- 输出：
+    - 评估报告（CSV/JSON）：记录每条样本的 prompt、参考结尾、模型补写结果、accept_rate（单条或整体统计）。
+    - 聚合指标：平均 accept_rate、命中率、拒绝数等，可直接对比不同静态词表策略。
+
+**流程建议**
+1. **语料截断**
+    - 读取给定语料（可以是单个 JSONL/CSV/纯文本文件），逐条去除空白。
+    - 对每条记录直接按 `truncate_ratio` 切分：`prompt = text[:N*ratio]`, `reference = text[N*ratio:]`，无需额外数据增强或混洗。
+    - 可将 `prompt/reference` 和 `sample_id` 写入一个简单的 JSONL 方便后续批量评测；如果语料较小，也可在内存中直接构造请求。
+2. **调用 SGlang 服务**
+     - 启动启用静态词表的草稿模型/主模型：
+
+```
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-4B \
+    --speculative-algorithm STANDALONE \
+    --speculative-draft-model-path Qwen/Qwen3-1.7B \
+    --speculative-use-static-vocab \
+    --speculative-static-vocab-path /tmp/custom_static_vocab.txt \
+    --max-total-tokens 8192 \
+    --log-level info
+```
+
+3. **批量评测脚本（待实现）**
+    - 针对语料中的每条记录（或者抽样 N 条）构造补写请求，`max_new_tokens` 建议设置为 `len(reference)`，保持补全长度一致。
+    - 解析响应中的 `accept_rate`（或通过 server metrics）；也可以从 server 的 request log 抓取 `accept_rate` 字段。
+    - 将结果写入例如 `domain_eval_result.jsonl`：
+
+```
+{
+    "sample_id": 42,
+    "prompt": "患者，男，45 岁...",
+    "reference": "入院后给予...",
+    "completion": "入院后给予...",
+    "accept_rate": 0.78
+}
+```
+
+4. **指标汇总**
+     - 计算平均 accept_rate / 中位数 / P90，并与完整版词表基线比较。
+     - 若 accept_rate 低于阈值，可回溯具体样本分析：是因为静态词表缺失关键 token 还是模型补写偏差。
+
+**CLI 草案**
+
+```
+python scripts/domain_corpus_accept_eval.py \
+    --corpus medical_notes.jsonl \
+    --text-key text \
+    --truncate-ratio 0.5 \
+    --sglang-endpoint http://127.0.0.1:30000/generate \
+    --output reports/medical_accept_eval.jsonl \
+    --max-samples 500 \
+    --concurrency 8
+```
+
+**产出要求**
+- 提供可复现的评测脚本/Notebook，附带 README，说明如何准备领域语料、如何设置静态词表以及如何解读 accept_rate。
+- 评测报告最好附带可视化（直方图或箱线图）展示 accept_rate 分布，帮助判断静态词表对特定领域的适用性。
+
 
 此阶段将允许用户提供一个外部文件来定义词汇表，给予用户更大的灵活性。
 
@@ -131,7 +337,7 @@ class LlamaForCausalLM(nn.Module):
         self.config = config
         # ...
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
+
         self.active_vocab_indices = None # 重命名以反映其通用性
 
         if config.use_static_vocab:
@@ -163,7 +369,7 @@ class LlamaForCausalLM(nn.Module):
             logits = torch.matmul(hidden_states, active_lm_head_weight.t())
         else:
             logits = self.lm_head(hidden_states)
-        
+
         return logits, ...
 ```
 
@@ -197,7 +403,7 @@ class DynamicVocabularyManager:
     def __init__(self, base_vocab_indices: Optional[torch.Tensor] = None):
         """
         初始化管理器。
-        
+
         Args:
             base_vocab_indices (Optional[torch.Tensor]):
                 一个一维张量，包含固定的静态词汇表词元 ID。
@@ -205,10 +411,10 @@ class DynamicVocabularyManager:
         """
         # 静态基础词汇表，永不改变
         self.base_vocab = set(base_vocab_indices.tolist() if base_vocab_indices is not None else [])
-        
+
         # 动态添加的词汇表，可在线更新
         self.dynamic_vocab = set()
-        
+
         # 当前合并后的活动词汇表（缓存）
         self._active_vocab_cache: Optional[torch.Tensor] = None
         self._is_dirty = True  # 标记缓存是否需要重建
@@ -217,7 +423,7 @@ class DynamicVocabularyManager:
         """
         向动态词汇表中添加新的词元 ID。
         这是一个外部接口，可由其他模块（如前缀缓存分析器）调用。
-        
+
         Args:
             token_ids (List[int]): 要添加的词元 ID 列表。
         """
@@ -231,7 +437,7 @@ class DynamicVocabularyManager:
         """
         获取当前完整、去重、排序后的活动词汇表索引。
         如果缓存有效，则直接返回；否则，重建缓存。
-        
+
         Returns:
             torch.Tensor: 一个包含所有活动词汇表词元 ID 的一维张量。
         """
@@ -240,7 +446,7 @@ class DynamicVocabularyManager:
             merged_vocab = sorted(list(self.base_vocab.union(self.dynamic_vocab)))
             self._active_vocab_cache = torch.tensor(merged_vocab, dtype=torch.long, device="cuda")
             self._is_dirty = False
-        
+
         return self._active_vocab_cache
 
     def get_active_vocab_size(self) -> int:
@@ -266,7 +472,7 @@ class LlamaForCausalLM(nn.Module):
         self.config = config
         # ...
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
+
         # --- 初始化 DynamicVocabularyManager ---
         self.vocab_manager = None
         if config.use_static_vocab:
@@ -284,7 +490,7 @@ class LlamaForCausalLM(nn.Module):
 
     def forward(self, input_ids, position_ids, seq_lens, ..., new_dynamic_tokens: Optional[List[int]] = None):
         # ...
-        
+
         # --- 新增：在每次 forward 调用时，动态更新词汇表 ---
         if self.vocab_manager and new_dynamic_tokens:
             self.vocab_manager.add(new_dynamic_tokens)
@@ -293,15 +499,15 @@ class LlamaForCausalLM(nn.Module):
         if self.vocab_manager:
             # 1. 在每次推理时获取最新的活动词汇表
             active_vocab_indices = self.vocab_manager.get_active_vocab()
-            
+
             # 2. 在此动态变化的词汇表上计算 Logits
             active_lm_head_weight = self.lm_head.weight.index_select(0, active_vocab_indices)
             logits = torch.matmul(hidden_states, active_lm_head_weight.t())
-            
+
             # 3. (重要) 后续的采样和 token 映射逻辑需要使用这个动态的 active_vocab_indices
         else:
             logits = self.lm_head(hidden_states)
-            
+
         return logits, ...
 ```
 
@@ -315,10 +521,10 @@ def inference_step(...):
     # ...
     # 运行草稿模型
     draft_outputs = draft_model.forward(...)
-    
+
     # 假设我们有一个分析器，它从最近的上下文中提取了新的高频词元
     newly_discovered_tokens = analyze_context_for_new_tokens(context) # e.g., [50257, 198, 628]
-    
+
     # 将新发现的词元添加到下一次迭代的词汇表中
     # 注意：这里需要将 new_dynamic_tokens 传递给下一次的 forward 调用
     # 或者，如果 draft_model 是一个共享实例，可以直接调用

@@ -15,7 +15,7 @@ logger = None
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch multiple OpenWebText shards in parallel and merge results.",
+        description="Launch multiple SlimPajama shards in parallel and merge results.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -26,7 +26,11 @@ def parse_args() -> argparse.Namespace:
         default="reducedVocab/stream_slimpajama_vocab.py",
         help="Path to the streaming script",
     )
-    parser.add_argument("--dataset", default="openwebtext")
+    parser.add_argument(
+        "--dataset",
+        default="Skylion007/openwebtext",
+        help="HuggingFace dataset repo id (supports streaming)",
+    )
     parser.add_argument("--split", default="train")
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--batch-size", type=int, default=512)

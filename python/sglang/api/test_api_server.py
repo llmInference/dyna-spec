@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import random
+from typing import Any, Dict
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,20 +25,99 @@ class DummyTokenizer:
         return ids
 
 
+class FakeResult:
+    def __init__(self, text: str, meta_info: Dict[str, Any] | None = None):
+        self._text = text
+        self._meta = meta_info or {"spec_accept_length": 0.0}
+
+    def text(self):
+        return self._text
+
+    def meta_info(self):
+        return self._meta
+
+
+class FakeLogitsProbe:
+    """Simulate backend logits processor behavior."""
+
+    def __init__(self, vocab_size: int = 32768, seed: int = 1234):
+        self.vocab_size = vocab_size
+        self.rng = random.Random(seed)
+        self.last_projected_ids = None
+        self.last_logits_vector = None
+
+    def project(self, token_ids):
+        if token_ids is None:
+            raise AssertionError("dynamic vocab ids must be provided")
+        if len(token_ids) == 0:
+            raise AssertionError("dynamic vocab ids must not be empty")
+        assert all(
+            0 <= tid < self.vocab_size for tid in token_ids
+        ), "token ids must be within base vocab"
+
+        # Simulate a full-vocab logits vector and then select the dynamic subset.
+        full_logits = [self.rng.random() for _ in range(self.vocab_size)]
+        subset_logits = [full_logits[tid] for tid in token_ids]
+
+        self.last_projected_ids = list(token_ids)
+        self.last_logits_vector = subset_logits
+        return subset_logits
+
+
+class FakeRuntime:
+    def __init__(self):
+        self.tokenizer = DummyTokenizer()
+        self.calls = []
+        self.logits_probe = FakeLogitsProbe()
+        self.vocab_size = 32768
+
+    def generate(
+        self,
+        prompt,
+        *,
+        sampling_params=None,
+        return_logprob=False,
+        logprob_start_len=None,
+        top_logprobs_num=None,
+        lora_path=None,
+    ):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "sampling_params": sampling_params,
+                "return_logprob": return_logprob,
+                "logprob_start_len": logprob_start_len,
+                "top_logprobs_num": top_logprobs_num,
+                "lora_path": lora_path,
+            }
+        )
+        dynamic_ids = sampling_params.get("dynamic_vocab_token_ids")
+        self.logits_probe.project(dynamic_ids)
+        return FakeResult("generated text")
+
+    def get_tokenizer(self):
+        return self.tokenizer
+    
+    def _get_model_info(self, force_refresh=False):
+        return {
+            "vocab_size": self.vocab_size,
+            "use_static_vocab": False,
+        }
+    
+    def get_server_info(self):
+        return {
+            "vocab_size": self.vocab_size,
+            "init_vocab_size": 327,  # Simulate initial vocab size
+        }
+
+
 @pytest.fixture
 def api_client(monkeypatch):
     from sglang.api import api_server
 
-    tokenizer = DummyTokenizer()
-    monkeypatch.setattr(api_server, "tokenizer", tokenizer, raising=False)
-
-    calls = {}
-
-    def fake_generate(**kwargs):
-        calls["kwargs"] = kwargs
-        return SimpleNamespace(text=lambda: "generated text")
-
-    monkeypatch.setattr(api_server.sgl, "gen", fake_generate)
+    backend = FakeRuntime()
+    prev_backend = sglang.global_config.default_backend
+    sglang.set_default_backend(backend)
 
     manager = ActiveVocabManager()
     monkeypatch.setattr(api_server, "vocab_manager", manager, raising=False)
@@ -45,50 +125,52 @@ def api_client(monkeypatch):
     monkeypatch.setattr(vocab_module, "vocab_manager", manager, raising=False)
 
     client = TestClient(api_server.app)
-    return client, manager, tokenizer, calls
+    yield client, manager, backend.tokenizer, backend
+    sglang.set_default_backend(prev_backend)
 
 
 def test_add_and_generate_flow(api_client):
-    client, manager, tokenizer, calls = api_client
+    client, manager, tokenizer, backend = api_client
 
     resp = client.post(
-        "/v1/vocab/add", json={"client_id": "client-1", "words": ["alpha", "beta"]}
+        "/v1/vocab/add", json={"words": ["alpha", "beta"]}
     )
     assert resp.status_code == 200
-    assert manager.get_vocab_list("client-1")
+    assert manager.get_vocab_list()
 
     resp = client.post(
         "/v1/generate",
         json={
-            "client_id": "client-1",
             "prompt": "Hello",
             "max_new_tokens": 5,
             "temperature": 0.5,
         },
     )
     assert resp.status_code == 200
-    assert resp.json() == {"text": "generated text"}
-    assert calls["kwargs"]["prompt"] == "Hello"
-    assert calls["kwargs"]["max_new_tokens"] == 5
-    assert calls["kwargs"]["temperature"] == 0.5
-    assert calls["kwargs"]["dynamic_vocab_token_ids"] == manager.get_vocab_list(
-        "client-1"
-    )
+    data = resp.json()
+    assert data["text"] == "generated text"
+    assert "meta_info" in data
+    call = backend.calls[-1]
+    assert call["prompt"] == "Hello"
+    params = call["sampling_params"]
+    assert params["max_new_tokens"] == 5
+    assert params["temperature"] == 0.5
+    assert params["dynamic_vocab_token_ids"] == manager.get_vocab_list()
 
 
 def test_remove_vocab_updates_manager(api_client):
     client, manager, tokenizer, _ = api_client
 
     client.post(
-        "/v1/vocab/add", json={"client_id": "client-2", "words": ["gamma", "delta"]}
+        "/v1/vocab/add", json={"words": ["gamma", "delta"]}
     )
     gamma_id = tokenizer.convert_tokens_to_ids(["gamma"])[0]
 
     resp = client.post(
-        "/v1/vocab/remove", json={"client_id": "client-2", "words": ["gamma"]}
+        "/v1/vocab/remove", json={"words": ["gamma"]}
     )
     assert resp.status_code == 200
-    remaining = manager.get_vocab_list("client-2")
+    remaining = manager.get_vocab_list()
     assert gamma_id not in remaining
 
 
@@ -96,8 +178,35 @@ def test_generate_without_vocab_fails(api_client):
     client, *_ = api_client
 
     resp = client.post(
-        "/v1/generate", json={"client_id": "missing", "prompt": "No vocab"}
+        "/v1/generate", json={"prompt": "No vocab"}
     )
     assert resp.status_code == 400
     assert "No active vocabulary" in resp.json()["detail"]
+
+
+def test_dynamic_vocab_reaches_logits_probe(api_client):
+    client, manager, _, backend = api_client
+
+    new_words = ["omega", "sigma", "lambda"]
+    resp = client.post(
+        "/v1/vocab/add", json={"words": new_words}
+    )
+    assert resp.status_code == 200
+
+    resp = client.post(
+        "/v1/generate",
+        json={
+            "prompt": "Testing dynamic vocab path",
+            "max_new_tokens": 4,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "generated text"
+    assert "meta_info" in data
+
+    expected_ids = manager.get_vocab_list()
+    assert expected_ids  # Should not be empty
+    assert backend.logits_probe.last_projected_ids == expected_ids
+    assert len(backend.logits_probe.last_logits_vector) == len(expected_ids)
 

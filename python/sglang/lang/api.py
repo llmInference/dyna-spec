@@ -72,9 +72,23 @@ def get_server_info(backend: Optional[BaseBackend] = None):
     return backend.get_server_info()
 
 
+def get_tokenizer(backend: Optional[BaseBackend] = None):
+    backend = backend or global_config.default_backend
+    if backend is None:
+        return None
+
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
+
+    if not hasattr(backend, "get_tokenizer"):
+        raise AttributeError("Backend does not expose get_tokenizer()")
+    return backend.get_tokenizer()
+
+
 def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    max_new_tokens: Optional[int] = None,
     min_tokens: Optional[int] = None,
     n: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
@@ -99,6 +113,13 @@ def gen(
     dynamic_vocab_token_ids: Optional[List[int]] = None,
 ):
     """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
+
+    if max_new_tokens is not None:
+        if max_tokens is not None and max_tokens != max_new_tokens:
+            raise ValueError(
+                "max_tokens and max_new_tokens cannot both be set to different values"
+            )
+        max_tokens = max_new_tokens
 
     if choices:
         return SglSelect(
@@ -139,6 +160,11 @@ def gen(
         json_schema,
         dynamic_vocab_token_ids,
     )
+
+
+def generate(*args, **kwargs):
+    """Backward-compatible wrapper for ``gen``."""
+    return gen(*args, **kwargs)
 
 
 def gen_int(

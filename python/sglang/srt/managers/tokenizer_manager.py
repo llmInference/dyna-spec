@@ -189,6 +189,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = ModelConfig.from_server_args(server_args)
+        self.draft_model_use_static_vocab: bool = False
+        self.draft_model_vocab_size: Optional[int] = None
+        self._init_draft_model_vocab_metadata()
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
@@ -467,6 +470,47 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             return "cross_encoder_pairs"
 
         return "batch_strings"
+
+    def _init_draft_model_vocab_metadata(self):
+        """Populate draft model static vocab metadata for HTTP introspection."""
+        self.draft_model_use_static_vocab = False
+        self.draft_model_vocab_size = None
+
+        default_vocab_size = int(self.model_config.hf_config.vocab_size)
+        server_args = self.server_args
+        draft_model_path = getattr(server_args, "speculative_draft_model_path", None)
+        if not draft_model_path:
+            self.draft_model_vocab_size = default_vocab_size
+            return
+
+        try:
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive metadata path
+            logger.warning(
+                "Failed to initialize draft model metadata for static vocabulary: %s",
+                exc,
+            )
+            self.draft_model_vocab_size = default_vocab_size
+            return
+
+        full_vocab_size = int(draft_model_config.hf_config.vocab_size)
+        self.draft_model_use_static_vocab = bool(draft_model_config.use_static_vocab)
+        if (
+            self.draft_model_use_static_vocab
+            and draft_model_config.static_vocab_indices is not None
+        ):
+            vocab_size = len(draft_model_config.static_vocab_indices)
+        elif self.draft_model_use_static_vocab:
+            vocab_size = int(draft_model_config.static_vocab_size)
+        else:
+            vocab_size = full_vocab_size
+
+        self.draft_model_vocab_size = vocab_size
 
     def _prepare_tokenizer_input(
         self, texts: Union[str, List[str]], input_format: str

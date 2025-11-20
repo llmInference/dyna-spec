@@ -1817,6 +1817,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
+        # Extract dynamic_vocab_token_ids from requests
+        # All requests share the same global dynamic vocab (1D tensor only)
+        dynamic_vocab_token_ids = None
+        if self.reqs:
+            # Get dynamic_vocab_token_ids from the first request
+            # All requests should use the same global dynamic vocab
+            first_req = self.reqs[0]
+            if first_req.sampling_params.dynamic_vocab_token_ids is not None:
+                vocab_list = first_req.sampling_params.dynamic_vocab_token_ids
+                if isinstance(vocab_list, list):
+                    dynamic_vocab_token_ids = torch.tensor(vocab_list, dtype=torch.long)
+                elif isinstance(vocab_list, torch.Tensor):
+                    dynamic_vocab_token_ids = vocab_list.to(torch.long)
+                else:
+                    dynamic_vocab_token_ids = torch.tensor(list(vocab_list), dtype=torch.long)
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -1865,6 +1881,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
+            dynamic_vocab_token_ids=dynamic_vocab_token_ids,
         )
 
     def copy(self):
@@ -1978,3 +1995,10 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # Dynamic vocab (subset projection) support.
+    # This can be:
+    # - None: no dynamic vocab
+    # - 1D tensor: all requests share the same dynamic vocab (global shared)
+    # - 2D tensor: each request has its own dynamic vocab (shape: [batch_size, vocab_size])
+    dynamic_vocab_token_ids: Optional[torch.Tensor] = None

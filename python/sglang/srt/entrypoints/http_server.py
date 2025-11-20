@@ -477,15 +477,35 @@ async def health_generate(request: Request) -> Response:
 @app.get("/get_model_info")
 async def get_model_info():
     """Get the model information."""
+    tokenizer_manager = _global_state.tokenizer_manager
+    model_config = tokenizer_manager.model_config
+    server_args = tokenizer_manager.server_args
+    draft_vocab_size = getattr(tokenizer_manager, "draft_model_vocab_size", None)
+    if draft_vocab_size is None:
+        draft_vocab_size = int(model_config.hf_config.vocab_size)
+    draft_use_static_vocab = bool(
+        getattr(tokenizer_manager, "draft_model_use_static_vocab", False)
+    )
+    # Get init_vocab_size and dyna_space from server args
+    init_vocab_size = getattr(server_args, "init_vocab_size", None)
+    if init_vocab_size is None:
+        # If not set, use draft_vocab_size as the initial vocab size
+        init_vocab_size = int(draft_vocab_size)
+    dyna_space = getattr(server_args, "dyna_space", 1024)
     result = {
-        "model_path": _global_state.tokenizer_manager.model_path,
-        "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
-        "is_generation": _global_state.tokenizer_manager.is_generation,
-        "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
-        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
-        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
+        "model_path": tokenizer_manager.model_path,
+        "tokenizer_path": tokenizer_manager.server_args.tokenizer_path,
+        "is_generation": tokenizer_manager.is_generation,
+        "preferred_sampling_params": tokenizer_manager.server_args.preferred_sampling_params,
+        "weight_version": tokenizer_manager.server_args.weight_version,
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "vocab_size": int(draft_vocab_size),  # For backward compatibility
+        "use_static_vocab": draft_use_static_vocab,  # For backward compatibility
+        "init_vocab_size": int(init_vocab_size),  # Initial vocabulary size for draft model
+        "dyna_space": int(dyna_space),  # Dynamic space for additional vocabulary tokens
     }
+
     return result
 
 

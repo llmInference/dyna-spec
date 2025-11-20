@@ -1,6 +1,7 @@
 import atexit
 import json
 import multiprocessing
+import threading
 import warnings
 from typing import Dict, List, Optional, Union
 
@@ -52,6 +53,9 @@ class RuntimeEndpoint(BaseBackend):
                 self.model_info["model_path"]
             )
 
+        self._tokenizer = None
+        self._tokenizer_lock = threading.Lock()
+
     def get_model_name(self):
         return self.model_info["model_path"]
 
@@ -75,6 +79,23 @@ class RuntimeEndpoint(BaseBackend):
 
     def get_chat_template(self):
         return self.chat_template
+
+    def get_tokenizer(self):
+        with self._tokenizer_lock:
+            if self._tokenizer is None:
+                tokenizer_path = self.model_info.get("tokenizer_path") or self.model_info.get("model_path")
+                if not tokenizer_path:
+                    raise RuntimeError(
+                        "Runtime endpoint did not expose tokenizer_path via /get_model_info"
+                    )
+                from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+                self._tokenizer = get_tokenizer(
+                    tokenizer_path,
+                    tokenizer_mode=self.model_info.get("tokenizer_mode", "auto"),
+                    trust_remote_code=bool(self.model_info.get("trust_remote_code", False)),
+                )
+            return self._tokenizer
 
     def cache_prefix(self, prefix_str: str):
         res = http_request(

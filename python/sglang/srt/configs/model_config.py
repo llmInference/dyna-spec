@@ -100,6 +100,7 @@ class ModelConfig:
         use_static_vocab: bool = False,
         static_vocab_ratio: float = 1.0,
         custom_vocab_path: Optional[str] = None,
+        init_vocab_size: Optional[int] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -166,7 +167,24 @@ class ModelConfig:
             ratio = float(requested_static_vocab_ratio)
             indices: Optional[List[int]] = None
 
-            if self.custom_vocab_path:
+            # If init_vocab_size is provided, use it directly instead of calculating from ratio
+            if init_vocab_size is not None:
+                if init_vocab_size > 0 and init_vocab_size <= vocab_size:
+                    self.use_static_vocab = True
+                    self.static_vocab_size = init_vocab_size
+                    self.static_vocab_ratio = self.static_vocab_size / vocab_size
+                    self.static_vocab_indices = list(range(self.static_vocab_size))
+                    logger.info(
+                        f"Using init_vocab_size={init_vocab_size} for draft model static vocabulary "
+                        f"(full vocab_size={vocab_size}, ratio={self.static_vocab_ratio:.4f})"
+                    )
+                else:
+                    logger.warning(
+                        f"Invalid init_vocab_size={init_vocab_size} (must be > 0 and <= {vocab_size}). "
+                        f"Falling back to static_vocab_ratio={ratio}."
+                    )
+                    # Fall through to use ratio-based calculation
+            elif self.custom_vocab_path:
                 indices, resolved_path = self._load_static_vocab_from_file(
                     self.custom_vocab_path, vocab_size
                 )
@@ -296,9 +314,18 @@ class ModelConfig:
             kwargs.setdefault(
                 "use_static_vocab", server_args.speculative_use_static_vocab
             )
-            kwargs.setdefault(
-                "static_vocab_ratio", server_args.speculative_static_vocab_ratio
-            )
+            # If init_vocab_size is provided, use it to calculate static_vocab_ratio
+            # This replaces the need for --speculative-static-vocab-ratio
+            if server_args.init_vocab_size is not None:
+                # We need to get the full vocab size to calculate the ratio
+                # This will be done in __init__, but we need to enable static vocab
+                kwargs["use_static_vocab"] = True
+                # Store init_vocab_size in kwargs so __init__ can use it
+                kwargs["init_vocab_size"] = server_args.init_vocab_size
+            else:
+                kwargs.setdefault(
+                    "static_vocab_ratio", server_args.speculative_static_vocab_ratio
+                )
             kwargs.setdefault(
                 "custom_vocab_path", server_args.speculative_static_vocab_path
             )

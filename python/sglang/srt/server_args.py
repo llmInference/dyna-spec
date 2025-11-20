@@ -523,6 +523,10 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
 
+    # Dynamic vocabulary configuration
+    init_vocab_size: Optional[int] = None
+    dyna_space: int = 1024
+
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
@@ -3439,6 +3443,20 @@ class ServerArgs:
             default=ServerArgs.rl_on_policy_target,
             choices=RL_ON_POLICY_TARGET_CHOICES,
             help="The training system that SGLang needs to match for true on-policy.",
+        )
+
+        # Dynamic vocabulary configuration
+        parser.add_argument(
+            "--init-vocab-size",
+            type=int,
+            default=ServerArgs.init_vocab_size,
+            help="Initial vocabulary size for dynamic vocabulary. This sets the size of the initial static vocabulary (replaces --speculative-static-vocab-ratio).",
+        )
+        parser.add_argument(
+            "--dyna-space",
+            type=int,
+            default=ServerArgs.dyna_space,
+            help="Dynamic space reserved for additional vocabulary tokens. This sets the buffer size for dynamic vocabulary additions (default: 1024).",
         )
 
         # Dynamic batch tokenizer

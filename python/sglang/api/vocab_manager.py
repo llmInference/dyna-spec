@@ -20,10 +20,10 @@ class ActiveVocabManager:
         # Use dyna_space parameter if provided, otherwise default to 1024
         self.capacity_buffer = dyna_space
         self.capacity: int = 0
-            # Track initial vocabulary size (from --init-vocab-size)
-            self.initial_vocab_size: int = 0
-            # Track if vocabulary has been initialized with initial vocab
-            self.initialized: bool = False
+        # Track initial vocabulary size (from --init-vocab-size)
+        self.initial_vocab_size: int = 0
+        # Track if vocabulary has been initialized with initial vocab
+        self.initialized: bool = False
         self.lock = threading.Lock()
 
     def initialize_config(self, vocab_size: int) -> None:

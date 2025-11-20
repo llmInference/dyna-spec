@@ -22,19 +22,20 @@ _DEFAULT_HTTP_TIMEOUT = 30.0
 
 _http_backend_lock = threading.Lock()
 _http_backend: Optional["_HttpRuntimeBackend"] = None
+DEFAULT_CLIENT_ID = "default_client"
 
 
 class VocabRequest(BaseModel):
-    client_id: str
+    client_id: Optional[str] = None
     words: List[str]
 
 
 class VocabQueryRequest(BaseModel):
-    client_id: str
+    client_id: Optional[str] = None
 
 
 class GenerateRequest(BaseModel):
-    client_id: str
+    client_id: Optional[str] = None
     prompt: str
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -124,6 +125,7 @@ def _ensure_client_vocab_initialized(client_id: str) -> None:
         dyna_space = 1024  # Default value
         try:
             from sglang.srt.server_args import get_global_server_args
+
             server_args = get_global_server_args()
             # Priority 1: Use init_vocab_size from server args if available
             if hasattr(server_args, "init_vocab_size") and server_args.init_vocab_size is not None:
@@ -131,7 +133,9 @@ def _ensure_client_vocab_initialized(client_id: str) -> None:
             # Get dyna_space from server args
             if hasattr(server_args, "dyna_space"):
                 dyna_space = int(server_args.dyna_space)
-        except (ImportError, AttributeError):
+        except (ImportError, AttributeError, ValueError):
+            # ValueError happens when the global args are not yet set; fall back to
+            # querying the backend below instead of crashing the request.
             pass
         
         # Priority 2: Try to get from SGLang server via /get_model_info
@@ -206,7 +210,7 @@ def _ensure_client_vocab_initialized(client_id: str) -> None:
         
         # Set dyna_space before initialization
         vocab_manager.set_dyna_space(dyna_space)
-        # Initialize with initial vocabulary size
+        # Initialize with the full static vocabulary so counts reflect the true draft state
         vocab_manager.initialize_static_vocab(init_vocab_size)
 
 
@@ -241,10 +245,32 @@ def _result_meta_info(result: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_avg_accept_length(meta: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Extract the draft model average acceptance length from meta info."""
+    if not meta:
+        return None
+    for key in ("avg_spec_accept_length", "spec_accept_length", "accept_length"):
+        value = meta.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+# Shared helper for defaulting client IDs when omitted in a request
+def _resolve_client_id(client_id: Optional[str]) -> str:
+    return client_id or DEFAULT_CLIENT_ID
+
+
 @app.post("/v1/vocab/add")
 def add_vocab(req: VocabRequest):
+    effective_client_id = _resolve_client_id(req.client_id)
     # Ensure vocabulary is initialized with initial vocab first
-    _ensure_client_vocab_initialized(req.client_id)
+    _ensure_client_vocab_initialized(effective_client_id)
     tok = _ensure_tokenizer()
     token_ids = tok.convert_tokens_to_ids(req.words)
     vocab_manager.add_words(token_ids)
@@ -259,8 +285,9 @@ def add_vocab(req: VocabRequest):
 
 @app.post("/v1/vocab/remove")
 def remove_vocab(req: VocabRequest):
+    effective_client_id = _resolve_client_id(req.client_id)
     # Ensure vocabulary is initialized with initial vocab first
-    _ensure_client_vocab_initialized(req.client_id)
+    _ensure_client_vocab_initialized(effective_client_id)
     tok = _ensure_tokenizer()
     token_ids = tok.convert_tokens_to_ids(req.words)
     vocab_manager.remove_words(token_ids)
@@ -273,6 +300,18 @@ def remove_vocab(req: VocabRequest):
     }
 
 
+def _build_vocab_query_response(client_id: Optional[str]) -> Dict[str, Union[str, int]]:
+    effective_client_id = client_id or DEFAULT_CLIENT_ID
+    _ensure_client_vocab_initialized(effective_client_id)
+    vocab_count = len(vocab_manager.get_vocab_list())
+    initial_vocab_count = vocab_manager.get_initial_vocab_size()
+    return {
+        "status": "success",
+        "vocab_count": vocab_count,
+        "initial_vocab_count": initial_vocab_count,
+    }
+
+
 @app.post("/v1/vocab/query")
 def query_vocab(req: VocabQueryRequest):
     """Query vocabulary information for a client.
@@ -282,15 +321,16 @@ def query_vocab(req: VocabQueryRequest):
     - initial_vocab_count: Initial vocabulary size (static, from --init-vocab-size parameter)
     If the vocabulary hasn't been initialized, it will be initialized first.
     """
-    # Ensure vocabulary is initialized with initial vocab first
-    _ensure_client_vocab_initialized(req.client_id)
-    vocab_count = len(vocab_manager.get_vocab_list())
-    initial_vocab_count = vocab_manager.get_initial_vocab_size()
-    return {
-        "status": "success",
-        "vocab_count": vocab_count,
-        "initial_vocab_count": initial_vocab_count
-    }
+    return _build_vocab_query_response(req.client_id)
+
+
+@app.get("/v1/vocab/query")
+def query_vocab_get(client_id: Optional[str] = None):
+    """GET-friendly wrapper for querying vocab status.
+    
+    If client_id is omitted, a shared default client identifier is used.
+    """
+    return _build_vocab_query_response(client_id)
 
 
 @app.get("/get_model_info")
@@ -351,12 +391,14 @@ def get_model_info():
 
 @app.post("/v1/generate")
 def generate(req: GenerateRequest):
+    effective_client_id = _resolve_client_id(req.client_id)
     # Ensure client vocabulary is initialized with static vocab first
-    _ensure_client_vocab_initialized(req.client_id)
+    _ensure_client_vocab_initialized(effective_client_id)
     active_vocab_ids = vocab_manager.get_vocab_list()
     if not active_vocab_ids:
         raise HTTPException(
-            status_code=400, detail=f"No active vocabulary for client {req.client_id}"
+            status_code=400,
+            detail=f"No active vocabulary for client {effective_client_id}",
         )
 
     sampling_kwargs = dict(req.sampling_params or {})
@@ -371,10 +413,15 @@ def generate(req: GenerateRequest):
         req.prompt,
         sampling_params=sampling_kwargs,
     )
-    response = {"text": result.text()}
+    response = {
+        "text": result.text(),
+    }
     meta = _result_meta_info(result)
-    if meta is not None:
-        response["meta_info"] = meta
+    avg_accept_length = _extract_avg_accept_length(meta)
+    if avg_accept_length is not None:
+        response["draft_avg_accept_length"] = avg_accept_length
+    # if meta is not None:
+    #     response["meta_info"] = meta
     return response
 
 

@@ -41,10 +41,37 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def _disable_hf_xet_download(reason: str) -> bool:
+    """Disable Hugging Face Xet downloads. Returns True if state changed."""
+    already_disabled = os.environ.get("HF_HUB_DISABLE_XET") == "1"
+    if not already_disabled:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    if hasattr(huggingface_hub.constants, "HF_HUB_DISABLE_XET"):
+        huggingface_hub.constants.HF_HUB_DISABLE_XET = True
+    if not already_disabled:
+        logger.warning(
+            "Disabled HF Xet downloads (%s); falling back to standard HF Hub path.",
+            reason,
+        )
+    return not already_disabled
+
+
+def _should_retry_without_xet(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "xet" in message or "cas service error" in message
+
+
+def _maybe_disable_hf_xet_from_env():
+    if envs.HF_HUB_DISABLE_XET.value:
+        _disable_hf_xet_download("HF_HUB_DISABLE_XET environment flag is set")
+
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -66,6 +93,7 @@ def enable_hf_transfer():
 
 
 enable_hf_transfer()
+_maybe_disable_hf_xet_from_env()
 
 
 class DisabledTqdm(tqdm):
@@ -449,8 +477,8 @@ def download_weights_from_hf(
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
-        hf_folder = snapshot_download(
-            model_name_or_path,
+        download_kwargs = dict(
+            repo_id=model_name_or_path,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
             cache_dir=cache_dir,
@@ -458,6 +486,19 @@ def download_weights_from_hf(
             revision=revision,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
+
+        def _do_snapshot_download():
+            return snapshot_download(**download_kwargs)
+
+        try:
+            hf_folder = _do_snapshot_download()
+        except RuntimeError as exc:
+            if _should_retry_without_xet(exc) and _disable_hf_xet_download(
+                f"snapshot_download failed: {exc}"
+            ):
+                hf_folder = _do_snapshot_download()
+            else:
+                raise
     return hf_folder
 
 
@@ -478,15 +519,28 @@ def download_safetensors_index_file_from_hf(
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
-        try:
-            # Download the safetensors index file.
-            hf_hub_download(
+        def _do_index_download():
+            return hf_hub_download(
                 repo_id=model_name_or_path,
                 filename=index_file,
                 cache_dir=cache_dir,
                 revision=revision,
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
+
+        def _download_with_optional_retry():
+            try:
+                return _do_index_download()
+            except RuntimeError as exc:
+                if _should_retry_without_xet(exc) and _disable_hf_xet_download(
+                    f"hf_hub_download failed: {exc}"
+                ):
+                    return _do_index_download()
+                raise
+
+        try:
+            # Download the safetensors index file.
+            _download_with_optional_retry()
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
         except huggingface_hub.utils.EntryNotFoundError:

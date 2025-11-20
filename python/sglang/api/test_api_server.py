@@ -28,7 +28,7 @@ class DummyTokenizer:
 class FakeResult:
     def __init__(self, text: str, meta_info: Dict[str, Any] | None = None):
         self._text = text
-        self._meta = meta_info or {"spec_accept_length": 0.0}
+        self._meta = meta_info or {"avg_spec_accept_length": 0.0}
 
     def text(self):
         return self._text
@@ -149,6 +149,7 @@ def test_add_and_generate_flow(api_client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["text"] == "generated text"
+    assert data["draft_avg_accept_length"] == 0.0
     assert "meta_info" in data
     call = backend.calls[-1]
     assert call["prompt"] == "Hello"
@@ -174,14 +175,24 @@ def test_remove_vocab_updates_manager(api_client):
     assert gamma_id not in remaining
 
 
-def test_generate_without_vocab_fails(api_client):
-    client, *_ = api_client
+def test_generate_without_vocab_uses_initial_vocab(api_client):
+    client, manager, _, backend = api_client
 
-    resp = client.post(
-        "/v1/generate", json={"prompt": "No vocab"}
-    )
-    assert resp.status_code == 400
-    assert "No active vocabulary" in resp.json()["detail"]
+    # Query once to trigger initialization
+    status = client.get("/v1/vocab/query").json()
+    assert status["vocab_count"] == status["initial_vocab_count"]
+    assert status["vocab_count"] == manager.get_initial_vocab_size()
+    assert status["vocab_count"] > 0
+
+    resp = client.post("/v1/generate", json={"prompt": "No vocab"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "generated text"
+
+    expected_ids = manager.get_vocab_list()
+    assert expected_ids
+    last_call = backend.calls[-1]
+    assert last_call["sampling_params"]["dynamic_vocab_token_ids"] == expected_ids
 
 
 def test_dynamic_vocab_reaches_logits_probe(api_client):
@@ -203,6 +214,7 @@ def test_dynamic_vocab_reaches_logits_probe(api_client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["text"] == "generated text"
+    assert data["draft_avg_accept_length"] == 0.0
     assert "meta_info" in data
 
     expected_ids = manager.get_vocab_list()

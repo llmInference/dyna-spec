@@ -14,7 +14,7 @@
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-4B \
     --speculative-algorithm STANDALONE \
-    --speculative-draft-model-path Qwen/Qwen3-1.7B \
+    --speculative-draft-model-path /root/models/Qwen3-1.7B \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
@@ -101,6 +101,18 @@ curl -X POST http://127.0.0.1:30000/v1/generate \
     "max_new_tokens": 10,
     "temperature": 0.7
   }'
+```
+
+示例：可以返回模型输出的内容和草稿模型的平均接受长度
+```
+(sglang2) root@autodl-container-0bc2448e04-fa8499c0:~/autodl-tmp/syq/d
+yna-spec# curl -X POST http://127.0.0.1:30000/v1/generate   -H "Content-Type: ap
+plication/json"   -d '{
+    "prompt": "what is the capital of france?",
+    "max_new_tokens": 10,
+    "temperature": 0.7
+  }'
+{"text":" (answer with just the name of the city,","draft_avg_accept_length":1.6666666666666667}
 ```
 
 **重要：** 词汇表会在首次使用前自动初始化初始词汇表（从 token ID 0 到 `init_vocab_size - 1`）。之后可以通过 `/v1/vocab/add` 添加额外的词汇。

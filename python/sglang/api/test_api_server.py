@@ -70,6 +70,7 @@ class FakeRuntime:
         self.calls = []
         self.logits_probe = FakeLogitsProbe()
         self.vocab_size = 32768
+        self.last_hidden_states = None
 
     def generate(
         self,
@@ -80,6 +81,7 @@ class FakeRuntime:
         logprob_start_len=None,
         top_logprobs_num=None,
         lora_path=None,
+        return_hidden_states=False,
     ):
         self.calls.append(
             {
@@ -89,11 +91,18 @@ class FakeRuntime:
                 "logprob_start_len": logprob_start_len,
                 "top_logprobs_num": top_logprobs_num,
                 "lora_path": lora_path,
+                "return_hidden_states": return_hidden_states,
             }
         )
         dynamic_ids = sampling_params.get("dynamic_vocab_token_ids")
         self.logits_probe.project(dynamic_ids)
-        return FakeResult("generated text")
+        meta = {"avg_spec_accept_length": 0.0}
+        if return_hidden_states:
+            self.last_hidden_states = [[float(i), float(i + 1)] for i in range(3)]
+            meta["hidden_states"] = self.last_hidden_states
+        else:
+            self.last_hidden_states = None
+        return FakeResult("generated text", meta_info=meta)
 
     def get_tokenizer(self):
         return self.tokenizer
@@ -221,4 +230,21 @@ def test_dynamic_vocab_reaches_logits_probe(api_client):
     assert expected_ids  # Should not be empty
     assert backend.logits_probe.last_projected_ids == expected_ids
     assert len(backend.logits_probe.last_logits_vector) == len(expected_ids)
+
+
+def test_hidden_states_endpoint_returns_meta(api_client):
+    client, manager, _, backend = api_client
+
+    client.post("/v1/vocab/add", json={"words": ["theta"]})
+    resp = client.post(
+        "/v1/hidden_states",
+        json={
+            "prompt": "Need hidden states",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["hidden_states"] == backend.last_hidden_states
+    assert data["meta_info"]["hidden_states"] == backend.last_hidden_states
+    assert data["meta_info"]["avg_spec_accept_length"] == 0.0
 

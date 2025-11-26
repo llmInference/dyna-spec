@@ -42,6 +42,10 @@ class GenerateRequest(BaseModel):
     sampling_params: Optional[Dict[str, Any]] = None
 
 
+class HiddenStateRequest(GenerateRequest):
+    """Request payload for fetching hidden states."""
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -261,6 +265,31 @@ def _extract_avg_accept_length(meta: Optional[Dict[str, Any]]) -> Optional[float
     return None
 
 
+def _generate_with_hidden_states(
+    backend: Any, prompt: str, sampling_kwargs: Dict[str, Any]
+):
+    """Invoke backend.generate ensuring hidden states are requested."""
+    generate_fn = getattr(backend, "generate", None)
+    if generate_fn is None:
+        raise HTTPException(
+            status_code=500, detail="Backend does not expose a generate() method"
+        )
+    try:
+        return generate_fn(
+            prompt,
+            sampling_params=sampling_kwargs,
+            return_hidden_states=True,
+        )
+    except TypeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Active backend does not support return_hidden_states. "
+                "Launch the runtime with --enable-return-hidden-states."
+            ),
+        ) from exc
+
+
 # Shared helper for defaulting client IDs when omitted in a request
 def _resolve_client_id(client_id: Optional[str]) -> str:
     return client_id or DEFAULT_CLIENT_ID
@@ -425,6 +454,48 @@ def generate(req: GenerateRequest):
     return response
 
 
+@app.post("/v1/hidden_states")
+def get_hidden_states(req: HiddenStateRequest):
+    """Fetch hidden states (last-layer features) for a prompt."""
+    effective_client_id = _resolve_client_id(req.client_id)
+    _ensure_client_vocab_initialized(effective_client_id)
+    active_vocab_ids = vocab_manager.get_vocab_list()
+    if not active_vocab_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No active vocabulary for client {effective_client_id}",
+        )
+
+    sampling_kwargs = dict(req.sampling_params or {})
+    sampling_kwargs["dynamic_vocab_token_ids"] = active_vocab_ids
+
+    if req.max_new_tokens is not None and "max_new_tokens" not in sampling_kwargs:
+        sampling_kwargs["max_new_tokens"] = req.max_new_tokens
+    else:
+        sampling_kwargs.setdefault("max_new_tokens", 0)
+
+    if req.temperature is not None and "temperature" not in sampling_kwargs:
+        sampling_kwargs["temperature"] = req.temperature
+
+    backend = _ensure_backend()
+    result = _generate_with_hidden_states(backend, req.prompt, sampling_kwargs)
+    meta = _result_meta_info(result) or {}
+    hidden_states = meta.get("hidden_states")
+    if hidden_states is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Backend did not return hidden states. "
+                "Make sure the runtime was launched with --enable-return-hidden-states."
+            ),
+        )
+
+    return {
+        "hidden_states": hidden_states,
+        "meta_info": meta,
+    }
+
+
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint."""
@@ -574,11 +645,21 @@ class _HttpRuntimeBackend:
         self._tokenizer = None
         self._tokenizer_lock = threading.Lock()
 
-    def generate(self, prompt: str, sampling_params: dict):
+    def generate(
+        self,
+        prompt: str,
+        sampling_params: dict,
+        *,
+        return_hidden_states: bool = False,
+    ):
         response = self._request(
             "POST",
             "/generate",
-            json={"text": prompt, "sampling_params": sampling_params},
+            json={
+                "text": prompt,
+                "sampling_params": sampling_params,
+                **({"return_hidden_states": True} if return_hidden_states else {}),
+            },
         )
         payload = response.json()
         text = _extract_text(payload)

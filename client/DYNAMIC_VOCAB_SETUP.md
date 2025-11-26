@@ -21,12 +21,14 @@ python3 -m sglang.launch_server \
     --max-total-tokens 16384 \
     --init-vocab-size 327 \
     --dyna-space 1024 \
+    --enable-return-hidden-states
     --port 30001
 ```
 
 **说明：**
 - `--init-vocab-size 327`：指定动态词汇表的初始大小（从 token ID 0 开始的前 327 个 token）
 - `--dyna-space 1024`：指定在初始词汇表基础上可以额外添加的 token 数量（默认：1024）
+- `--enable-return-hidden-states`:可以实现拉取最后隐藏层特征向量 
 
 ### 初始词汇表配置
 
@@ -116,6 +118,35 @@ plication/json"   -d '{
 ```
 
 **重要：** 词汇表会在首次使用前自动初始化初始词汇表（从 token ID 0 到 `init_vocab_size - 1`）。之后可以通过 `/v1/vocab/add` 添加额外的词汇。
+
+### 获取隐藏层特征（可选）
+
+如果需要拉取 Transformer 最后一层的 hidden states（以及完整 meta 信息），可以使用新增的 `/v1/hidden_states`：
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/hidden_states \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Need transformer features"
+  }'
+```
+
+- 与 `/v1/generate` 一样会自动复用动态词汇表；
+- 若未显式指定 `max_new_tokens`，默认只做前向（`max_new_tokens=0`）；
+- 返回 JSON：
+  ```json
+  {
+    "hidden_states": [[...], [...]],
+    "meta_info": {
+      "hidden_states": [[...], [...]],
+      "prompt_tokens": 15,
+      "completion_tokens": 0,
+      ...
+    }
+  }
+  ```
+
+> ⚠️ 运行时需以 `--enable-return-hidden-states` 启动，否则该接口会提示未开启。
 
 ## 4. 动态词汇表的范围限制
 

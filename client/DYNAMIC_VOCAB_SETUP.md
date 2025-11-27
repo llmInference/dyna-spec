@@ -14,14 +14,14 @@
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-4B \
     --speculative-algorithm STANDALONE \
-    --speculative-draft-model-path /root/models/Qwen3-1.7B \
+    --speculative-draft-model-path Qwen/Qwen3-1.7B \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --max-total-tokens 16384 \
     --init-vocab-size 327 \
     --dyna-space 1024 \
-    --enable-return-hidden-states
+    --enable-return-hidden-states \
     --port 30001
 ```
 

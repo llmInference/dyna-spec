@@ -940,10 +940,17 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
 
-        # If dynamic vocab is enabled, we should not apply static vocab projection or
+        # Dynamic vocab should only be used for draft models.
+        # For target models, always use full vocabulary.
+        is_draft_model = logits_metadata.forward_mode.is_draft_extend(include_v2=True)
+        dynamic_vocab_active = (
+            logits_metadata.dynamic_vocab_token_ids is not None and is_draft_model
+        )
+        
+        # If dynamic vocab is enabled for draft models, we should not apply static vocab projection or
         # truncate to full vocab. The caller is responsible for interpreting the
         # returned logits according to `dynamic_vocab_token_ids`.
-        if logits_metadata.dynamic_vocab_token_ids is None:
+        if not dynamic_vocab_active:
             if self.use_static_vocab and self.static_vocab_size:
                 static_indices = self._get_static_indices_for_device(logits.device)
                 logits = torch.index_select(logits, dim=1, index=static_indices).float()
@@ -958,7 +965,7 @@ class LogitsProcessor(nn.Module):
                 else:
                     logits = logits[:, : self.config.vocab_size].float()
         else:
-            # Dynamic vocab active: ensure static vocab is marked inactive so that
+            # Dynamic vocab active for draft model: ensure static vocab is marked inactive so that
             # downstream components do not attempt to use it.
             self._active_static_indices = None
 
@@ -1040,9 +1047,15 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Dynamic vocab (subset projection) has the highest priority and disables static vocab.
+        # Dynamic vocab (subset projection) should only be used for draft models.
+        # Target models should use the full vocabulary to ensure output quality.
         dynamic_ids = logits_metadata.dynamic_vocab_token_ids
-        if dynamic_ids is not None and hasattr(lm_head, "weight"):
+        is_draft_model = (
+            logits_metadata.forward_mode.is_draft_extend(include_v2=True)
+        )
+        
+        # Only apply dynamic vocab for draft models, not for target models
+        if dynamic_ids is not None and hasattr(lm_head, "weight") and is_draft_model:
             # Normalize ids to a LongTensor on the lm_head weight device.
             if not isinstance(dynamic_ids, torch.Tensor):
                 dynamic_ids = torch.as_tensor(dynamic_ids, dtype=torch.long)
@@ -1064,6 +1077,9 @@ class LogitsProcessor(nn.Module):
             logits = torch.matmul(hidden_proj, weight_slice.T)
             
             return logits.to(hidden_states.dtype)
+        
+        # For target models or when dynamic vocab is not provided, use full vocabulary
+        # This ensures target models always use the complete vocabulary for quality
 
         # Static vocab path (only when dynamic vocab is not active).
         if self.use_static_vocab and isinstance(lm_head, VocabParallelEmbedding):

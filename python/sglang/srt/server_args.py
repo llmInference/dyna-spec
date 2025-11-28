@@ -526,6 +526,7 @@ class ServerArgs:
     # Dynamic vocabulary configuration
     init_vocab_size: Optional[int] = None
     dyna_space: int = 1024
+    custom_vocab_path: Optional[str] = None  # Path to custom vocabulary file (JSON format with token_ids list)
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -3450,13 +3451,20 @@ class ServerArgs:
             "--init-vocab-size",
             type=int,
             default=ServerArgs.init_vocab_size,
-            help="Initial vocabulary size for dynamic vocabulary. This sets the size of the initial static vocabulary (replaces --speculative-static-vocab-ratio).",
+            help="Initial vocabulary size for dynamic vocabulary. This sets the size of the initial static vocabulary (replaces --speculative-static-vocab-ratio). Mutually exclusive with --custom-vocab.",
         )
         parser.add_argument(
             "--dyna-space",
             type=int,
             default=ServerArgs.dyna_space,
             help="Dynamic space reserved for additional vocabulary tokens. This sets the buffer size for dynamic vocabulary additions (default: 1024).",
+        )
+        parser.add_argument(
+            "--custom-vocab",
+            type=str,
+            default=ServerArgs.custom_vocab_path,
+            dest="custom_vocab_path",
+            help="Path to a JSON file containing custom vocabulary token IDs. The file should contain a list of token IDs, e.g., {\"token_ids\": [0, 1, 2, ...]}. This will be used as the initial vocabulary for the draft model. Mutually exclusive with --init-vocab-size.",
         )
 
         # Dynamic batch tokenizer
@@ -3744,6 +3752,13 @@ class ServerArgs:
 
         # Check LoRA
         self.check_lora_server_args()
+        
+        # Check dynamic vocabulary configuration
+        if self.custom_vocab_path is not None and self.init_vocab_size is not None:
+            raise ValueError(
+                "--init-vocab-size and --custom-vocab are mutually exclusive. "
+                "Please use either --init-vocab-size or --custom-vocab, not both."
+            )
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:

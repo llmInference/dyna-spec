@@ -1,15 +1,21 @@
 import threading
 from collections import deque
-from typing import List
+from typing import List, Optional
 
 
 class ActiveVocabManager:
     """Thread-safe global active vocabulary tracker for draft model.
     
-    The vocabulary is initialized with the initial vocabulary (from --init-vocab-size).
+    This manager uniformly handles two initialization modes:
+    1. --init-vocab-size mode: Initialize with consecutive token IDs [0, 1, 2, ..., init_vocab_size-1]
+    2. --custom-vocab mode: Initialize with custom token IDs directly as the initial vocabulary
+    
     Words can then be added or removed from this vocabulary dynamically.
     The vocabulary represents the current draft model vocabulary, which can grow or shrink
     based on client requests.
+    
+    vocab_count and initial_vocab_count can be read directly from this manager
+    without distinguishing between different initialization modes.
     """
 
     def __init__(self, dyna_space: int = 1024) -> None:
@@ -39,7 +45,10 @@ class ActiveVocabManager:
                 self.initialized = True
     
     def initialize_static_vocab(self, vocab_size: int) -> None:
-        """Initialize the vocabulary with the initial vocabulary (0 to vocab_size-1).
+        """Initialize the vocabulary with consecutive token IDs (0 to vocab_size-1).
+        
+        This is used in --init-vocab-size mode. The vocabulary is initialized with
+        consecutive token IDs [0, 1, 2, ..., vocab_size-1] based on the specified size.
         
         This should be called once before any add/remove operations.
         If called multiple times, it will reset the vocabulary to the initial vocab.
@@ -56,6 +65,73 @@ class ActiveVocabManager:
                 self.capacity = max(self.capacity, vocab_size)
             # Store initial vocabulary size
             self.initial_vocab_size = vocab_size
+            self.initialized = True
+    
+    def load_custom_vocab(self, token_ids: List[int], dyna_space: Optional[int] = None, vocab_size: Optional[int] = None) -> None:
+        """Load a custom vocabulary from a list of token IDs.
+        
+        This is used in --custom-vocab mode. The custom vocabulary is directly used
+        as the initial vocabulary for the draft model. The custom vocabulary will be used
+        for the draft model only, while the target model uses the full vocabulary.
+        
+        IMPORTANT: The token_ids in the custom vocabulary MUST be valid token IDs from the
+        target model's vocabulary. The mapping relationship is guaranteed by:
+        1. Server-side validation: token_ids are validated against target model vocab_size during loading
+        2. Direct mapping: dynamic_vocab_token_ids array serves as the mapping table
+           - Array index = local index in draft model (0, 1, 2, ...)
+           - Array value = global token ID in target model (from custom vocab)
+        3. Runtime mapping: sampler._map_dynamic_vocab_token_ids() maps local indices to global token IDs
+        
+        Args:
+            token_ids: List of token IDs to use as the initial vocabulary.
+                      These MUST be valid token IDs from the target model's vocabulary.
+            dyna_space: Optional dynamic space buffer. If None, uses the current capacity_buffer.
+            vocab_size: Optional target model vocabulary size for validation.
+                       If provided, invalid token IDs (out of range) will be filtered out.
+        """
+        with self.lock:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_token_ids = []
+            invalid_count = 0
+            
+            for token_id in token_ids:
+                # Validate token ID if vocab_size is provided
+                if vocab_size is not None:
+                    if not isinstance(token_id, int) or token_id < 0 or token_id >= vocab_size:
+                        invalid_count += 1
+                        import logging
+                        logging.warning(
+                            f"Ignoring invalid token ID {token_id} in custom vocabulary "
+                            f"(expected 0 <= id < {vocab_size})"
+                        )
+                        continue
+                
+                if token_id not in seen:
+                    seen.add(token_id)
+                    unique_token_ids.append(token_id)
+            
+            if invalid_count > 0:
+                import logging
+                logging.warning(
+                    f"Filtered out {invalid_count} invalid token IDs from custom vocabulary. "
+                    f"Loaded {len(unique_token_ids)} valid token IDs."
+                )
+            
+            if not unique_token_ids:
+                raise ValueError(
+                    "No valid token IDs in custom vocabulary. "
+                    "All token IDs must be in the range [0, vocab_size)."
+                )
+            
+            self.vocab = deque(unique_token_ids)
+            # Update capacity if dyna_space is provided
+            if dyna_space is not None:
+                self.capacity_buffer = dyna_space
+            # Set capacity to vocab size + buffer
+            self.capacity = len(unique_token_ids) + self.capacity_buffer
+            # Store initial vocabulary size (for compatibility)
+            self.initial_vocab_size = len(unique_token_ids)
             self.initialized = True
 
     def is_initialized(self) -> bool:

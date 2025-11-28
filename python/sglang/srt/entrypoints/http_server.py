@@ -486,10 +486,74 @@ async def get_model_info():
     draft_use_static_vocab = bool(
         getattr(tokenizer_manager, "draft_model_use_static_vocab", False)
     )
+    # Get static_vocab_indices if available (for custom_vocab mode)
+    import logging
+    draft_static_vocab_indices = getattr(tokenizer_manager, "draft_model_static_vocab_indices", None)
+    
+    # Diagnostic: Log the initial state
+    if draft_static_vocab_indices is not None:
+        logging.info(
+            f"Found draft_model_static_vocab_indices in tokenizer_manager: "
+            f"{len(draft_static_vocab_indices)} token IDs"
+        )
+    else:
+        logging.warning(
+            f"draft_model_static_vocab_indices is None in tokenizer_manager. "
+            f"draft_model_use_static_vocab={draft_use_static_vocab}, "
+            f"draft_model_vocab_size={draft_vocab_size}"
+        )
+    
+    # If custom_vocab_path is set but static_vocab_indices is None, try to reload from draft model config
+    # This is a fallback mechanism in case _init_draft_model_vocab_metadata() failed to save the indices
+    custom_vocab_path = getattr(server_args, "custom_vocab_path", None)
+    if custom_vocab_path is not None and draft_static_vocab_indices is None:
+        logging.warning(
+            f"custom_vocab_path is set ({custom_vocab_path}) but draft_model_static_vocab_indices is None. "
+            f"Attempting to reload from draft_model_config..."
+        )
+        # Try to get static_vocab_indices directly from draft model config
+        try:
+            from sglang.srt.configs.model_config import ModelConfig
+            draft_model_path = getattr(server_args, "speculative_draft_model_path", None)
+            if draft_model_path:
+                logging.info(f"Reloading from draft_model_path: {draft_model_path}")
+                draft_model_config = ModelConfig.from_server_args(
+                    server_args,
+                    model_path=draft_model_path,
+                    model_revision=server_args.speculative_draft_model_revision,
+                    is_draft_model=True,
+                )
+                if draft_model_config.static_vocab_indices is not None:
+                    draft_static_vocab_indices = list(draft_model_config.static_vocab_indices)
+                    # Also update tokenizer_manager for future use
+                    tokenizer_manager.draft_model_static_vocab_indices = draft_static_vocab_indices
+                    logging.info(
+                        f"Successfully reloaded static_vocab_indices: {len(draft_static_vocab_indices)} token IDs. "
+                        f"Updated tokenizer_manager.draft_model_static_vocab_indices"
+                    )
+                else:
+                    logging.error(
+                        f"draft_model_config.static_vocab_indices is None. "
+                        f"use_static_vocab={draft_model_config.use_static_vocab}, "
+                        f"static_vocab_size={getattr(draft_model_config, 'static_vocab_size', None)}, "
+                        f"custom_vocab_path={custom_vocab_path}"
+                    )
+            else:
+                logging.error(f"speculative_draft_model_path is None, cannot reload static_vocab_indices")
+        except Exception as e:
+            logging.error(
+                f"Failed to reload static_vocab_indices from draft model config: {e}. "
+                f"This will cause API server to fall back to full vocabulary size."
+            )
+            import traceback
+            logging.debug(traceback.format_exc())
+    
     # Get init_vocab_size and dyna_space from server args
     init_vocab_size = getattr(server_args, "init_vocab_size", None)
     if init_vocab_size is None:
-        # If not set, use draft_vocab_size as the initial vocab size
+        # If not set (e.g., in --custom-vocab mode), use draft_vocab_size as the initial vocab size
+        # draft_vocab_size should already be set correctly for custom vocab (via _init_draft_model_vocab_metadata)
+        # In custom_vocab mode, draft_vocab_size reflects the actual custom vocab size (len(static_vocab_indices))
         init_vocab_size = int(draft_vocab_size)
     dyna_space = getattr(server_args, "dyna_space", 1024)
     result = {
@@ -505,6 +569,25 @@ async def get_model_info():
         "init_vocab_size": int(init_vocab_size),  # Initial vocabulary size for draft model
         "dyna_space": int(dyna_space),  # Dynamic space for additional vocabulary tokens
     }
+    # Include static_vocab_indices if available (for custom_vocab mode)
+    # This allows API server to initialize with the correct token IDs instead of [0, 1, 2, ...]
+    if draft_static_vocab_indices is not None:
+        result["static_vocab_indices"] = draft_static_vocab_indices
+        logging.info(
+            f"Returning static_vocab_indices with {len(draft_static_vocab_indices)} token IDs for custom_vocab mode"
+        )
+    else:
+        # If custom_vocab_path is set but static_vocab_indices is still None, log a critical error
+        if custom_vocab_path is not None:
+            logging.error(
+                f"CRITICAL: custom_vocab_path is set ({custom_vocab_path}) but static_vocab_indices is None. "
+                f"API server will fall back to full vocabulary size ({draft_vocab_size}) instead of custom vocabulary. "
+                f"This indicates a problem with custom_vocab initialization. "
+                f"Please check: "
+                f"1. Is the custom_vocab file valid? "
+                f"2. Did ModelConfig.load_static_vocab_from_file() succeed? "
+                f"3. Did tokenizer_manager._init_draft_model_vocab_metadata() save the indices?"
+            )
 
     return result
 

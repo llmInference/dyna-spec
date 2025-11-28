@@ -475,6 +475,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Populate draft model static vocab metadata for HTTP introspection."""
         self.draft_model_use_static_vocab = False
         self.draft_model_vocab_size = None
+        self.draft_model_static_vocab_indices = None
 
         default_vocab_size = int(self.model_config.hf_config.vocab_size)
         server_args = self.server_args
@@ -500,15 +501,40 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         full_vocab_size = int(draft_model_config.hf_config.vocab_size)
         self.draft_model_use_static_vocab = bool(draft_model_config.use_static_vocab)
+        
+        # Check if custom_vocab_path is set (indicates custom_vocab mode)
+        custom_vocab_path = getattr(server_args, "custom_vocab_path", None)
+        
         if (
             self.draft_model_use_static_vocab
             and draft_model_config.static_vocab_indices is not None
         ):
             vocab_size = len(draft_model_config.static_vocab_indices)
+            # Store static_vocab_indices for API server to use in custom_vocab mode
+            self.draft_model_static_vocab_indices = list(draft_model_config.static_vocab_indices)
+            import logging
+            logging.info(
+                f"Saved draft_model_static_vocab_indices with {vocab_size} token IDs "
+                f"(custom_vocab_path={custom_vocab_path})"
+            )
         elif self.draft_model_use_static_vocab:
             vocab_size = int(draft_model_config.static_vocab_size)
+            # If custom_vocab_path is set but static_vocab_indices is None, log a warning
+            if custom_vocab_path is not None:
+                import logging
+                logging.warning(
+                    f"custom_vocab_path is set ({custom_vocab_path}) but static_vocab_indices is None. "
+                    f"Using static_vocab_size={vocab_size} instead."
+                )
         else:
             vocab_size = full_vocab_size
+            # If custom_vocab_path is set but use_static_vocab is False, log a warning
+            if custom_vocab_path is not None:
+                import logging
+                logging.warning(
+                    f"custom_vocab_path is set ({custom_vocab_path}) but use_static_vocab is False. "
+                    f"Using full vocab_size={vocab_size} instead."
+                )
 
         self.draft_model_vocab_size = vocab_size
 

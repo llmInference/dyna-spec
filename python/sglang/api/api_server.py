@@ -34,6 +34,18 @@ class VocabQueryRequest(BaseModel):
     client_id: Optional[str] = None
 
 
+class CustomVocabRequest(BaseModel):
+    """Request to load a custom vocabulary from token IDs.
+    
+    This is useful for loading vocabularies obtained from tokenizing datasets
+    with the same model's tokenizer. The custom vocabulary will be used for
+    the draft model only, while the target model uses the full vocabulary.
+    """
+    client_id: Optional[str] = None
+    token_ids: List[int]
+    dyna_space: Optional[int] = None  # Optional dynamic space buffer
+
+
 class GenerateRequest(BaseModel):
     client_id: Optional[str] = None
     prompt: str
@@ -116,58 +128,93 @@ def _ensure_tokenizer():
 def _ensure_client_vocab_initialized(client_id: str) -> None:
     """Ensure the draft model vocabulary is initialized with the initial vocabulary.
     
-    If the vocabulary hasn't been initialized yet, this will initialize it with
-    the initial vocabulary size (from --init-vocab-size) obtained from the SGLang server
-    via /get_model_info or server args. This ensures the API server uses the exact same
-    initial vocab size as the server.
+    Two initialization modes are supported:
+    1. --init-vocab-size mode: Initialize with consecutive token IDs [0, 1, 2, ..., init_vocab_size-1]
+    2. --custom-vocab mode: Initialize with custom token IDs from the server
     
-    Note: The vocabulary is global and shared across all clients.
+    The vocabulary is global and shared across all clients.
+    vocab_manager will manage all vocabulary data uniformly, and vocab_count/initial_vocab_count
+    can be read directly from vocab_manager without distinguishing modes.
     """
     if not vocab_manager.is_initialized():
-        # Try to get init_vocab_size from server args first (most direct)
-        init_vocab_size = None
         dyna_space = 1024  # Default value
-        try:
-            from sglang.srt.server_args import get_global_server_args
-
-            server_args = get_global_server_args()
-            # Priority 1: Use init_vocab_size from server args if available
-            if hasattr(server_args, "init_vocab_size") and server_args.init_vocab_size is not None:
-                init_vocab_size = int(server_args.init_vocab_size)
-            # Get dyna_space from server args
-            if hasattr(server_args, "dyna_space"):
-                dyna_space = int(server_args.dyna_space)
-        except (ImportError, AttributeError, ValueError):
-            # ValueError happens when the global args are not yet set; fall back to
-            # querying the backend below instead of crashing the request.
-            pass
+        static_vocab_indices = None
+        init_vocab_size = None
         
-        # Priority 2: Try to get from SGLang server via /get_model_info
-        if init_vocab_size is None:
+        # Priority 1: Try to get from SGLang server via /get_model_info
+        import logging
+        try:
+            backend = _ensure_backend()
+            if hasattr(backend, "_get_model_info"):
+                model_info = backend._get_model_info(force_refresh=True)
+                
+                # Get dyna_space
+                if "dyna_space" in model_info:
+                    dyna_space = int(model_info["dyna_space"])
+                
+                # Determine vocabulary initialization mode based on server response
+                # We use static_vocab_indices (not custom_vocab_path) because:
+                # 1. custom_vocab_path is a server startup parameter, not available in API server
+                # 2. static_vocab_indices is the actual loaded data, more reliable
+                # 3. static_vocab_indices presence indicates custom_vocab mode is active
+                
+                # Mode 1: Dynamic vocabulary with vocabulary table control (--custom-vocab mode)
+                # This mode uses a custom vocabulary table with specific token IDs
+                if "static_vocab_indices" in model_info and model_info["static_vocab_indices"] is not None:
+                    static_vocab_indices = model_info["static_vocab_indices"]
+                    logging.info(
+                        f"Mode: Dynamic vocabulary with vocabulary table control (--custom-vocab). "
+                        f"Custom vocabulary contains {len(static_vocab_indices)} token IDs"
+                    )
+                
+                # Mode 2: Dynamic vocabulary with size control (--init-vocab-size mode)
+                # This mode uses consecutive token IDs [0, 1, 2, ..., init_vocab_size-1]
+                elif "init_vocab_size" in model_info:
+                    init_vocab_size = int(model_info["init_vocab_size"])
+                    logging.info(
+                        f"Mode: Dynamic vocabulary with size control (--init-vocab-size). "
+                        f"Initial vocabulary size: {init_vocab_size}"
+                    )
+                
+                # Mode 3: Static vocabulary (no dynamic vocabulary, use full vocabulary)
+                # This mode uses the complete vocabulary without dynamic management
+                elif "vocab_size" in model_info:
+                    init_vocab_size = int(model_info["vocab_size"])
+                    use_static_vocab = model_info.get("use_static_vocab", False)
+                    if use_static_vocab:
+                        logging.warning(
+                            "Mode: Static vocabulary detected, but use_static_vocab=True and "
+                            "static_vocab_indices is missing. This might indicate a problem with "
+                            "custom_vocab initialization. Falling back to full vocabulary."
+                        )
+                    else:
+                        logging.info(
+                            f"Mode: Static vocabulary (no dynamic vocabulary). "
+                            f"Using full vocabulary size: {init_vocab_size}"
+                        )
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to get model info from backend: {e}")
+            # Fallback to server args
             try:
-                backend = _ensure_backend()
-                if hasattr(backend, "_get_model_info"):
-                    # For HttpRuntimeBackend, use _get_model_info
-                    # Force refresh to ensure we get the latest values after server restart
-                    model_info = backend._get_model_info(force_refresh=True)
-                    # The vocab_size from model_info is actually the initial vocab size
-                    reported_vocab_size = model_info.get("vocab_size")
-                    if reported_vocab_size is not None:
-                        init_vocab_size = int(reported_vocab_size)
-                    # Also try to get init_vocab_size directly if available
-                    if "init_vocab_size" in model_info:
-                        init_vocab_size = int(model_info["init_vocab_size"])
-                    # Try to get dyna_space from model_info if available
-                    if "dyna_space" in model_info:
-                        dyna_space = int(model_info["dyna_space"])
-            except Exception as e:
-                # Fallback: try to get from server args if available
-                import logging
-                logging.warning(f"Failed to get model info from backend: {e}")
+                from sglang.srt.server_args import get_global_server_args
+                server_args = get_global_server_args()
+                # Check if custom_vocab_path is set (indicates custom_vocab mode)
+                custom_vocab_path = getattr(server_args, "custom_vocab_path", None)
+                if custom_vocab_path is not None:
+                    logging.warning(
+                        f"custom_vocab_path is set ({custom_vocab_path}) but static_vocab_indices is not available. "
+                        "This might indicate a problem with custom_vocab initialization."
+                    )
+                if hasattr(server_args, "init_vocab_size") and server_args.init_vocab_size is not None:
+                    init_vocab_size = int(server_args.init_vocab_size)
+                if hasattr(server_args, "dyna_space"):
+                    dyna_space = int(server_args.dyna_space)
+            except (ImportError, AttributeError, ValueError):
                 pass
         
-        # Priority 3: Fallback to calculating from tokenizer and server args
-        if init_vocab_size is None:
+        # Priority 2: Fallback to calculating from tokenizer and server args
+        if static_vocab_indices is None and init_vocab_size is None:
             try:
                 from sglang.srt.server_args import get_global_server_args
                 server_args = get_global_server_args()
@@ -187,14 +234,8 @@ def _ensure_client_vocab_initialized(client_id: str) -> None:
                             detail="Cannot determine vocabulary size from tokenizer",
                         )
                 
-                # Use the use_static_vocab value from server_args
                 if use_static_vocab_fallback:
                     init_vocab_size = max(1, int(full_vocab_size * static_vocab_ratio))
-                    import logging
-                    logging.info(
-                        f"Using fallback initial vocab size calculation: {init_vocab_size} "
-                        f"(ratio={static_vocab_ratio}, full_vocab_size={full_vocab_size})"
-                    )
                 else:
                     init_vocab_size = full_vocab_size
             except (ImportError, AttributeError):
@@ -212,10 +253,64 @@ def _ensure_client_vocab_initialized(client_id: str) -> None:
                             detail="Cannot determine vocabulary size from tokenizer or server",
                         )
         
-        # Set dyna_space before initialization
-        vocab_manager.set_dyna_space(dyna_space)
-        # Initialize with the full static vocabulary so counts reflect the true draft state
-        vocab_manager.initialize_static_vocab(init_vocab_size)
+        # Initialize vocabulary based on detected mode
+        # Mode 1: Dynamic vocabulary with vocabulary table control (--custom-vocab mode)
+        # Initialize with custom token IDs directly as initial vocabulary
+        if static_vocab_indices is not None:
+            logging.info(
+                f"Initializing vocab_manager: Dynamic vocabulary with vocabulary table control. "
+                f"Loading {len(static_vocab_indices)} custom token IDs"
+            )
+            # Get target model vocab_size for validation
+            # The token_ids in static_vocab_indices should already be validated by the server,
+            # but we validate again here for safety
+            target_vocab_size = None
+            try:
+                tokenizer = _ensure_tokenizer()
+                target_vocab_size = getattr(tokenizer, "vocab_size", None)
+                if target_vocab_size is None:
+                    if hasattr(tokenizer, "vocab"):
+                        target_vocab_size = len(tokenizer.vocab)
+                    elif hasattr(tokenizer, "get_vocab"):
+                        target_vocab_size = len(tokenizer.get_vocab())
+            except Exception:
+                pass  # If we can't get vocab_size, skip validation (server already validated)
+            
+            vocab_manager.load_custom_vocab(
+                token_ids=static_vocab_indices, 
+                dyna_space=dyna_space,
+                vocab_size=target_vocab_size
+            )
+            logging.info(
+                f"vocab_manager initialized successfully: "
+                f"vocab_count={len(vocab_manager.get_vocab_list())}, "
+                f"initial_vocab_count={vocab_manager.get_initial_vocab_size()}"
+            )
+        
+        # Mode 2: Dynamic vocabulary with size control (--init-vocab-size mode)
+        # Initialize with consecutive token IDs [0, 1, 2, ..., init_vocab_size-1]
+        elif init_vocab_size is not None:
+            logging.info(
+                f"Initializing vocab_manager: Dynamic vocabulary with size control. "
+                f"Initial vocabulary size: {init_vocab_size}"
+            )
+            vocab_manager.set_dyna_space(dyna_space)
+            vocab_manager.initialize_static_vocab(init_vocab_size)
+            logging.info(
+                f"vocab_manager initialized successfully: "
+                f"vocab_count={len(vocab_manager.get_vocab_list())}, "
+                f"initial_vocab_count={vocab_manager.get_initial_vocab_size()}"
+            )
+        
+        # Mode 3: Static vocabulary (fallback - should not reach here in normal operation)
+        else:
+            logging.error("Failed to determine vocabulary initialization mode")
+            raise HTTPException(
+                status_code=500,
+                detail="Cannot determine initial vocabulary configuration. "
+                       "Please check server configuration and ensure either --init-vocab-size "
+                       "or --custom-vocab is properly set.",
+            )
 
 
 def _ensure_backend():
@@ -346,8 +441,11 @@ def query_vocab(req: VocabQueryRequest):
     """Query vocabulary information for a client.
     
     Returns the current vocabulary count (vocab_count) and initial vocabulary count (initial_vocab_count).
+    Both values are read directly from vocab_manager, which uniformly manages vocabulary data
+    for both --init-vocab-size and --custom-vocab modes.
+    
     - vocab_count: Current draft model vocabulary size (dynamic, changes with add/remove operations)
-    - initial_vocab_count: Initial vocabulary size (static, from --init-vocab-size parameter)
+    - initial_vocab_count: Initial vocabulary size (static, from initial vocabulary configuration)
     If the vocabulary hasn't been initialized, it will be initialized first.
     """
     return _build_vocab_query_response(req.client_id)
@@ -360,6 +458,47 @@ def query_vocab_get(client_id: Optional[str] = None):
     If client_id is omitted, a shared default client identifier is used.
     """
     return _build_vocab_query_response(client_id)
+
+
+@app.post("/v1/vocab/load_custom")
+def load_custom_vocab(req: CustomVocabRequest):
+    """Load a custom vocabulary from a list of token IDs.
+    
+    This endpoint allows loading a vocabulary obtained from tokenizing datasets
+    with the same model's tokenizer. The custom vocabulary will be used for
+    the draft model only, while the target model uses the full vocabulary.
+    
+    Example:
+        POST /v1/vocab/load_custom
+        {
+            "token_ids": [0, 1, 2, 100, 200, 300],
+            "dyna_space": 1024
+        }
+    """
+    effective_client_id = _resolve_client_id(req.client_id)
+    
+    # Validate token IDs
+    if not req.token_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="token_ids cannot be empty"
+        )
+    
+    # Load custom vocabulary
+    vocab_manager.load_custom_vocab(
+        token_ids=req.token_ids,
+        dyna_space=req.dyna_space
+    )
+    
+    vocab_count = len(vocab_manager.get_vocab_list())
+    initial_vocab_count = vocab_manager.get_initial_vocab_size()
+    
+    return {
+        "status": "success",
+        "vocab_count": vocab_count,
+        "initial_vocab_count": initial_vocab_count,
+        "message": "Custom vocabulary loaded successfully. This vocabulary will be used for draft models only."
+    }
 
 
 @app.get("/get_model_info")

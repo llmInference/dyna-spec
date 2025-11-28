@@ -314,6 +314,10 @@ class ModelConfig:
             kwargs.setdefault(
                 "use_static_vocab", server_args.speculative_use_static_vocab
             )
+            # Use custom_vocab_path if provided, otherwise fall back to speculative_static_vocab_path
+            custom_vocab = getattr(server_args, "custom_vocab_path", None) or server_args.speculative_static_vocab_path
+            kwargs.setdefault("custom_vocab_path", custom_vocab)
+            
             # If init_vocab_size is provided, use it to calculate static_vocab_ratio
             # This replaces the need for --speculative-static-vocab-ratio
             if server_args.init_vocab_size is not None:
@@ -322,13 +326,25 @@ class ModelConfig:
                 kwargs["use_static_vocab"] = True
                 # Store init_vocab_size in kwargs so __init__ can use it
                 kwargs["init_vocab_size"] = server_args.init_vocab_size
+            # If custom_vocab_path is provided, we must enable static vocab to load it
+            # Note: "static_vocab" here refers to the INITIAL vocabulary (loaded at startup),
+            # not a permanently static vocabulary. The initial vocab can be:
+            # - A custom vocabulary table (--custom-vocab mode)
+            # - A consecutive range [0, 1, ..., init_vocab_size-1] (--init-vocab-size mode)
+            # After initialization, vocabulary can still be dynamically managed via API
+            # (add/remove tokens), which is the "dynamic" part of the system.
+            elif custom_vocab is not None:
+                kwargs["use_static_vocab"] = True
+                logger.info(
+                    f"custom_vocab_path is set ({custom_vocab}), enabling use_static_vocab=True "
+                    f"for draft model to load initial custom vocabulary table. "
+                    f"Note: 'static' here means the initial vocabulary is fixed at startup; "
+                    f"vocabulary can still be dynamically managed via API after initialization."
+                )
             else:
                 kwargs.setdefault(
                     "static_vocab_ratio", server_args.speculative_static_vocab_ratio
                 )
-            kwargs.setdefault(
-                "custom_vocab_path", server_args.speculative_static_vocab_path
-            )
         else:
             kwargs.setdefault("use_static_vocab", False)
             kwargs.setdefault("static_vocab_ratio", 1.0)
@@ -382,6 +398,78 @@ class ModelConfig:
 
         indices: List[int] = []
         seen_tokens: Set[int] = set()
+        invalid_count = 0
+        
+        # Try to load as JSON first (for custom vocab format)
+        try:
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "token_ids" in data:
+                    # JSON format: {"token_ids": [0, 1, 2, ...]}
+                    token_ids = data["token_ids"]
+                    if not isinstance(token_ids, list):
+                        raise ValueError("token_ids must be a list")
+                    for token_id in token_ids:
+                        if not isinstance(token_id, int):
+                            invalid_count += 1
+                            continue
+                        if token_id < 0 or token_id >= vocab_size:
+                            invalid_count += 1
+                            logger.warning(
+                                "Ignoring out-of-range token id %d in %s (expected 0 <= id < %d).",
+                                token_id,
+                                resolved_path,
+                                vocab_size,
+                            )
+                            continue
+                        if token_id not in seen_tokens:
+                            seen_tokens.add(token_id)
+                            indices.append(token_id)
+                    if indices:
+                        logger.info(
+                            "Loaded %d static vocab tokens from JSON file %s%s.",
+                            len(indices),
+                            resolved_path,
+                            f" ({invalid_count} invalid entries omitted)" if invalid_count > 0 else "",
+                        )
+                        return indices, resolved_path
+                elif isinstance(data, list):
+                    # JSON format: [0, 1, 2, ...]
+                    for token_id in data:
+                        if not isinstance(token_id, int):
+                            invalid_count += 1
+                            continue
+                        if token_id < 0 or token_id >= vocab_size:
+                            invalid_count += 1
+                            logger.warning(
+                                "Ignoring out-of-range token id %d in %s (expected 0 <= id < %d).",
+                                token_id,
+                                resolved_path,
+                                vocab_size,
+                            )
+                            continue
+                        if token_id not in seen_tokens:
+                            seen_tokens.add(token_id)
+                            indices.append(token_id)
+                    if indices:
+                        logger.info(
+                            "Loaded %d static vocab tokens from JSON file %s%s.",
+                            len(indices),
+                            resolved_path,
+                            f" ({invalid_count} invalid entries omitted)" if invalid_count > 0 else "",
+                        )
+                        return indices, resolved_path
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            # Not a valid JSON file, fall through to text format
+            logger.debug(
+                "File %s is not in JSON format, trying text format: %s",
+                resolved_path,
+                str(e),
+            )
+        
+        # Fall back to text format (one token ID per line)
+        indices = []
+        seen_tokens = set()
         invalid_count = 0
         with open(resolved_path, "r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, start=1):

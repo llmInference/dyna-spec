@@ -47,7 +47,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --max-total-tokens 16384 \
-    --custom-vocab ./client/vocab_400.json \
+    --custom-vocab ./client/vocab_3000.json \
     --dyna-space 1024 \
     --enable-return-hidden-states \
     --port 30001
@@ -73,63 +73,6 @@ python3 -m sglang.launch_server \
 ```json
 [0, 1, 2, 100, 200, 300, 500, 1000]
 ```
-
-**注意：**
-- `--init-vocab-size` 和 `--custom-vocab` 是互斥的，不能同时使用
-- 如果使用 `--custom-vocab`，则不需要指定 `--init-vocab-size`
-- 自定义词汇表中的 token ID 必须在有效范围内（0 <= token_id < vocab_size）
-- 自定义词汇表将作为草稿模型的初始词汇表，目标模型始终使用完整词汇表
-
-**词汇表映射机制：**
-
-自定义词汇表与目标模型词汇表的映射是自动完成的：
-
-1. **映射表**：`dynamic_vocab_token_ids` 数组本身就是映射表
-   - 数组索引 = 草稿模型的局部索引（0, 1, 2, ...）
-   - 数组值 = 目标模型的全局 token ID
-
-2. **映射示例**：
-   ```python
-   # 假设自定义词汇表为 [0, 100, 200, 300]
-   dynamic_vocab_token_ids = [0, 100, 200, 300]
-   
-   # 草稿模型采样得到局部索引 1
-   local_index = 1
-   
-   # 自动映射到全局 token ID
-   global_token_id = dynamic_vocab_token_ids[local_index]  # = 100
-   
-   # 目标模型使用全局 token ID 100 进行验证
-   ```
-
-3. **验证过程**：
-   - 加载自定义词汇表时，系统会验证所有 token ID 是否在目标模型词汇表范围内
-   - 超出范围的 token ID 会被自动忽略并记录警告
-   - 确保所有自定义词汇表中的 token ID 都是目标模型词汇表中的有效 token
-
-4. **重要提示**：
-   - 自定义词汇表中的 token ID 必须是目标模型词汇表中的有效 token ID
-   - 这些 token ID 不需要连续，可以是任意顺序
-   - 系统会自动处理映射，无需手动配置 
-
-### 初始词汇表配置
-
-动态词汇表从初始词汇表开始，有两种配置方式：
-
-**方式一：使用 `--init-vocab-size`**
-- 指定初始词汇表的 token 数量，从 token ID 0 开始到 `init_vocab_size - 1`
-- 例如，如果词汇表总大小为 32768，想要使用前 327 个 token 作为初始词汇表：
-  ```bash
-  --init-vocab-size 327
-  ```
-
-**方式二：使用 `--custom-vocab`**
-- 从 JSON 文件加载自定义词汇表（同模型 tokenizer 在不同数据集下分词得到的词汇表）
-- 文件格式：`{"token_ids": [0, 1, 2, ...]}` 或 `[0, 1, 2, ...]`
-- 例如：
-  ```bash
-  --custom-vocab /path/to/custom_vocab.json
-  ```
 
 **注意：** 
 - `--init-vocab-size` 和 `--custom-vocab` 是互斥的，不能同时使用
@@ -198,7 +141,7 @@ curl -X POST http://127.0.0.1:30000/v1/vocab/remove \
 curl -X POST http://127.0.0.1:30000/v1/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Hello, world",
+    "prompt": "1,2,3,4,",
     "max_new_tokens": 10,
     "temperature": 0.7
   }'

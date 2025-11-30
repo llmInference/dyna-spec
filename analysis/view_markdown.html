@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>推测解码分析报告查看器</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f5f5f5;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .header {
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #e0e0e0;
+        }
+        
+        .header h1 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+        
+        .file-selector {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+        
+        .file-selector label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #555;
+        }
+        
+        .file-selector input[type="file"] {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 100%;
+            max-width: 400px;
+        }
+        
+        .file-selector button {
+            margin-top: 10px;
+            padding: 8px 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .file-selector button:hover {
+            background: #0056b3;
+        }
+        
+        .file-list {
+            margin-top: 15px;
+        }
+        
+        .file-list a {
+            display: inline-block;
+            margin: 5px 10px 5px 0;
+            padding: 6px 12px;
+            background: #e9ecef;
+            color: #495057;
+            text-decoration: none;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .file-list a:hover {
+            background: #dee2e6;
+        }
+        
+        .content {
+            margin-top: 20px;
+        }
+        
+        .content h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .content h2 {
+            color: #34495e;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #ecf0f1;
+        }
+        
+        .content h3 {
+            color: #555;
+            margin-top: 25px;
+            margin-bottom: 12px;
+        }
+        
+        .content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            background: white;
+        }
+        
+        .content table th {
+            background: #3498db;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+        }
+        
+        .content table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .content table tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .content code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        .content pre {
+            background: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            border-left: 4px solid #3498db;
+        }
+        
+        .content strong {
+            color: #2c3e50;
+            font-weight: 600;
+        }
+        
+        .content del {
+            color: #e74c3c;
+            text-decoration: line-through;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .error {
+            padding: 15px;
+            background: #fee;
+            border-left: 4px solid #e74c3c;
+            color: #c33;
+            border-radius: 4px;
+            margin: 20px 0;
+        }
+        
+        .info {
+            padding: 10px;
+            background: #e7f3ff;
+            border-left: 4px solid #2196F3;
+            border-radius: 4px;
+            margin: 15px 0;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 推测解码分析报告查看器</h1>
+            <div class="info">
+                支持查看Markdown格式的分析报告。您可以选择本地文件或使用下方的文件链接。
+            </div>
+        </div>
+        
+        <div class="file-selector">
+            <label for="fileInput">选择Markdown文件：</label>
+            <input type="file" id="fileInput" accept=".md,.markdown" />
+            <button onclick="loadFile()">加载文件</button>
+            
+            <div class="file-list" id="fileList" style="display: none;">
+                <strong>或选择已有文件：</strong><br>
+            </div>
+        </div>
+        
+        <div id="content" class="content">
+            <div class="loading">请选择一个Markdown文件进行查看</div>
+        </div>
+    </div>
+    
+    <script>
+        // 获取当前目录下的所有md文件
+        async function loadFileList() {
+            try {
+                const response = await fetch('/api/files');
+                if (response.ok) {
+                    const files = await response.json();
+                    const fileList = document.getElementById('fileList');
+                    if (files.length > 0) {
+                        fileList.style.display = 'block';
+                        files.forEach(file => {
+                            const link = document.createElement('a');
+                            link.href = '#';
+                            link.textContent = file;
+                            link.onclick = (e) => {
+                                e.preventDefault();
+                                loadFileFromServer(file);
+                            };
+                            fileList.appendChild(link);
+                        });
+                    }
+                }
+            } catch (error) {
+                console.log('无法获取文件列表（可能不在服务器模式下运行）');
+            }
+        }
+        
+        // 从服务器加载文件
+        async function loadFileFromServer(filename) {
+            const contentDiv = document.getElementById('content');
+            contentDiv.innerHTML = '<div class="loading">正在加载...</div>';
+            
+            try {
+                const response = await fetch(`/api/file/${filename}`);
+                if (!response.ok) {
+                    throw new Error('文件加载失败');
+                }
+                const text = await response.text();
+                renderMarkdown(text);
+            } catch (error) {
+                contentDiv.innerHTML = `<div class="error">错误: ${error.message}</div>`;
+            }
+        }
+        
+        // 从本地文件加载
+        function loadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alert('请先选择一个文件');
+                return;
+            }
+            
+            const contentDiv = document.getElementById('content');
+            contentDiv.innerHTML = '<div class="loading">正在加载...</div>';
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                renderMarkdown(e.target.result);
+            };
+            reader.onerror = function() {
+                contentDiv.innerHTML = '<div class="error">文件读取失败</div>';
+            };
+            reader.readAsText(file, 'UTF-8');
+        }
+        
+        // 渲染Markdown
+        function renderMarkdown(text) {
+            const contentDiv = document.getElementById('content');
+            try {
+                // 配置marked选项
+                marked.setOptions({
+                    breaks: true,
+                    gfm: true
+                });
+                
+                const html = marked.parse(text);
+                contentDiv.innerHTML = html;
+            } catch (error) {
+                contentDiv.innerHTML = `<div class="error">Markdown解析错误: ${error.message}</div>`;
+            }
+        }
+        
+        // 页面加载时尝试获取文件列表
+        window.onload = function() {
+            loadFileList();
+            
+            // 检查URL参数
+            const urlParams = new URLSearchParams(window.location.search);
+            const file = urlParams.get('file');
+            if (file) {
+                loadFileFromServer(file);
+            }
+        };
+    </script>
+</body>
+</html>
+

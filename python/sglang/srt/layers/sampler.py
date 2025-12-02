@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -82,6 +82,7 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        dynamic_vocab_mapping = logits_output.dynamic_vocab_token_ids
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
@@ -175,6 +176,13 @@ class Sampler(nn.Module):
                     logits_output.next_token_top_logprobs_val,
                     logits_output.next_token_top_logprobs_idx,
                 ) = get_top_logprobs(logprobs, top_logprobs_nums)
+                if dynamic_vocab_mapping is not None:
+                    logits_output.next_token_top_logprobs_idx = (
+                        self._remap_dynamic_vocab_top_indices(
+                            logits_output.next_token_top_logprobs_idx,
+                            dynamic_vocab_mapping,
+                        )
+                    )
 
             if any(x is not None for x in token_ids_logprobs):
                 (
@@ -188,7 +196,11 @@ class Sampler(nn.Module):
             ]
 
         mapping = logits_output.static_vocab_token_ids
-        if mapping is not None:
+        if dynamic_vocab_mapping is not None:
+            batch_next_token_ids = self._map_dynamic_vocab_token_ids(
+                batch_next_token_ids, dynamic_vocab_mapping
+            )
+        elif mapping is not None:
             mapped_ids = mapping[batch_next_token_ids]
             batch_next_token_ids = mapped_ids.to(batch_next_token_ids.dtype)
 
@@ -249,6 +261,13 @@ class Sampler(nn.Module):
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, top_logprobs_nums)
+            if logits_output.dynamic_vocab_token_ids is not None:
+                logits_output.next_token_top_logprobs_idx = (
+                    self._remap_dynamic_vocab_top_indices(
+                        logits_output.next_token_top_logprobs_idx,
+                        logits_output.dynamic_vocab_token_ids,
+                    )
+                )
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
@@ -256,6 +275,63 @@ class Sampler(nn.Module):
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+
+    def _map_dynamic_vocab_token_ids(
+        self,
+        batch_next_token_ids: torch.Tensor,
+        dynamic_vocab_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map sampled indices in the dynamic vocab space back to global ids.
+        
+        Args:
+            batch_next_token_ids: Local token IDs in dynamic vocab space [batch_size]
+            dynamic_vocab_token_ids: 1D tensor mapping local indices to global token IDs [vocab_size]
+        
+        Returns:
+            Global token IDs [batch_size]
+        """
+        if not isinstance(dynamic_vocab_token_ids, torch.Tensor):
+            raise TypeError("dynamic_vocab_token_ids must be a torch.Tensor")
+        
+        if dynamic_vocab_token_ids.dim() != 1:
+            raise ValueError(
+                f"dynamic_vocab_token_ids must be 1D tensor, got {dynamic_vocab_token_ids.dim()}D"
+            )
+        
+        mapping = dynamic_vocab_token_ids.to(batch_next_token_ids.device)
+        return mapping.index_select(0, batch_next_token_ids.long()).to(
+            batch_next_token_ids.dtype
+        )
+
+    def _remap_dynamic_vocab_top_indices(
+        self,
+        top_indices: List[List[int]],
+        dynamic_vocab_token_ids: Optional[torch.Tensor],
+    ) -> List[List[int]]:
+        """Remap local dynamic vocab indices produced by get_top_logprobs.
+        
+        Args:
+            top_indices: List of lists of local token indices in dynamic vocab space
+            dynamic_vocab_token_ids: 1D tensor mapping local indices to global token IDs [vocab_size], or None
+        
+        Returns:
+            List of lists of global token IDs
+        """
+        if dynamic_vocab_token_ids is None:
+            return top_indices
+
+        if not isinstance(dynamic_vocab_token_ids, torch.Tensor):
+            raise TypeError("dynamic_vocab_token_ids must be a torch.Tensor")
+        
+        if dynamic_vocab_token_ids.dim() != 1:
+            raise ValueError(
+                f"dynamic_vocab_token_ids must be 1D tensor, got {dynamic_vocab_token_ids.dim()}D"
+            )
+
+        mapping_cpu = dynamic_vocab_token_ids.cpu()
+        return [
+            [int(mapping_cpu[idx]) for idx in indices] for indices in top_indices
+        ]
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(

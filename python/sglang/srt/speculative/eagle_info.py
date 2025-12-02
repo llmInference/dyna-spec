@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
@@ -188,6 +188,165 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    def _print_verification_details(
+        self,
+        batch: ScheduleBatch,
+        candidates: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        predict: torch.Tensor,
+        target_probs: Optional[torch.Tensor] = None,
+        prev_output_ids_list: Optional[List[List[int]]] = None,
+    ):
+        """Print detailed verification information for each request."""
+        bs = candidates.shape[0]
+        accept_index_cpu = accept_index.cpu().tolist()
+        candidates_cpu = candidates.cpu().tolist()
+        predict_cpu = predict.cpu().tolist()
+        accept_length_cpu = accept_length.cpu().tolist()
+        
+        # Get target probabilities if available
+        target_probs_cpu = None
+        if target_probs is not None:
+            target_probs_cpu = target_probs.cpu()
+
+        for i, req in enumerate(batch.reqs):
+            if i >= bs:
+                break
+                
+            # Get tokenizer if available
+            tokenizer = getattr(req, 'tokenizer', None)
+            if tokenizer is None:
+                tokenizer = getattr(batch, 'tokenizer', None)
+            
+            # Get previous outputs (before this verification round)
+            if prev_output_ids_list is not None and i < len(prev_output_ids_list):
+                prev_output_ids = prev_output_ids_list[i]
+            else:
+                # Fallback: try to get from req.output_ids
+                num_new_tokens = accept_length_cpu[i] + 1  # +1 for bonus token
+                prev_output_ids = req.output_ids[:-num_new_tokens] if len(req.output_ids) > num_new_tokens else []
+            context_text = ""
+            if tokenizer is not None and len(prev_output_ids) > 0:
+                try:
+                    # Get last 20 tokens for better context
+                    context_tokens = prev_output_ids[-20:] if len(prev_output_ids) >= 20 else prev_output_ids
+                    context_text = tokenizer.decode(context_tokens)
+                except Exception as e:
+                    context_text = f"Token IDs: {prev_output_ids[-10:] if prev_output_ids else []}"
+            else:
+                context_text = f"Token IDs: {prev_output_ids[-10:] if prev_output_ids else []}"
+            
+            # Calculate rejection layer
+            accept_row = accept_index_cpu[i]
+            rejection_layer = -1
+            
+            # Find the first rejected position (first -1)
+            for j in range(len(accept_row)):
+                if accept_row[j] == -1:
+                    rejection_layer = j
+                    break
+            
+            if rejection_layer == -1:
+                rejection_layer = self.draft_token_num
+            
+            # Get draft candidates for this request
+            # candidates shape is (bs, draft_token_num), containing all draft tokens
+            # For display, we'll show the first few candidates
+            # Note: The actual tree structure is more complex, but for logging purposes
+            # we'll show the first topk candidates
+            draft_candidates_list = []
+            for pos in range(min(self.topk, len(candidates_cpu[i]))):
+                if pos < len(candidates_cpu[i]):
+                    draft_candidates_list.append(candidates_cpu[i][pos])
+            
+            # Get bonus token (the first accepted token, which is the bonus)
+            bonus_token_id = None
+            bonus_token_prob = 0.0
+            if len(accept_row) > 0 and accept_row[0] != -1:
+                bonus_idx = accept_row[0]
+                if bonus_idx < len(predict_cpu):
+                    bonus_token_id = predict_cpu[bonus_idx]
+                    # Get probability for bonus token
+                    # Bonus token is the target model's prediction at the root position
+                    if target_probs_cpu is not None:
+                        # target_probs shape: (bs, draft_token_num, vocab_size)
+                        # Bonus token corresponds to target prediction at position 0 (root)
+                        if i < target_probs_cpu.shape[0] and bonus_token_id < target_probs_cpu.shape[2]:
+                            bonus_token_prob = target_probs_cpu[i, 0, bonus_token_id].item()
+            
+            # Print verification details
+            print("\n" + "="*60)
+            if rejection_layer < self.draft_token_num:
+                print(f"Draft Failed at Layer {rejection_layer}.")
+            else:
+                print(f"Draft Accepted All {self.draft_token_num} Tokens.")
+            
+            print(f"\nContext: \"{context_text}\"")
+            print("-" * 60)
+            
+            # Print draft candidates
+            print(f"❌ Draft Candidates (Top-{self.topk} guess):")
+            for k, candidate_id in enumerate(draft_candidates_list[:self.topk]):
+                candidate_text = ""
+                if tokenizer is not None and candidate_id != -1:
+                    try:
+                        candidate_text = tokenizer.decode([candidate_id])
+                    except Exception as e:
+                        candidate_text = f"Token {candidate_id}"
+                else:
+                    candidate_text = f"Token {candidate_id}"
+                
+                # Draft probability is not directly available, use placeholder
+                draft_prob = 0.0
+                print(f"   {k+1}. \"{candidate_text}\" (prob: {draft_prob:.2f})")
+            
+            print("-" * 60)
+            
+            # Print target decision (bonus token)
+            if bonus_token_id is not None:
+                bonus_text = ""
+                if tokenizer is not None:
+                    try:
+                        bonus_text = tokenizer.decode([bonus_token_id])
+                    except Exception as e:
+                        bonus_text = f"Token {bonus_token_id}"
+                else:
+                    bonus_text = f"Token {bonus_token_id}"
+                
+                print(f"✅ Target Decision (Bonus Token):")
+                print(f"   -> \"{bonus_text}\" (prob: {bonus_token_prob:.2f})")
+            else:
+                print("✅ Target Decision (Bonus Token):")
+                print("   -> No bonus token")
+            
+            print("-" * 60)
+            
+            # Print analysis
+            if rejection_layer < self.draft_token_num and len(draft_candidates_list) > 0:
+                draft_pred = draft_candidates_list[0] if len(draft_candidates_list) > 0 else -1
+                draft_pred_text = ""
+                if tokenizer is not None and draft_pred != -1:
+                    try:
+                        draft_pred_text = tokenizer.decode([draft_pred])
+                    except Exception as e:
+                        draft_pred_text = f"Token {draft_pred}"
+                else:
+                    draft_pred_text = f"Token {draft_pred}"
+                
+                target_wanted_text = ""
+                if bonus_token_id is not None and tokenizer is not None:
+                    try:
+                        target_wanted_text = tokenizer.decode([bonus_token_id])
+                    except Exception as e:
+                        target_wanted_text = f"Token {bonus_token_id}"
+                else:
+                    target_wanted_text = f"Token {bonus_token_id}" if bonus_token_id is not None else "None"
+                
+                print(f"Analyze: Draft predicted '{draft_pred_text}', but Target wanted '{target_wanted_text}'.")
+            
+            print("="*60 + "\n")
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -207,6 +366,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
+            return EagleVerifyOutput(
+                draft_input=EagleDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=batch.model_config.hidden_size,
+                    dtype=batch.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                ),
+                logits_output=logits_output,
+                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                accept_length_per_req_cpu=[],
+                accepted_indices=torch.full(
+                    (0, self.spec_steps + 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=batch.device,
+                ),
+            )
+
+        # Skip verification in prefill-only phase
+        # Speculative decoding should only happen in decode phase, not in prefill phase
+        is_prefill_only = getattr(batch, 'is_prefill_only', False)
+        if is_prefill_only and batch.forward_mode.is_extend():
+            # This is a prefill-only batch, should not perform speculative decoding
+            logger.warning(
+                "Attempted to verify in prefill-only phase. "
+                "Speculative decoding should only occur in decode phase. "
+                "Skipping verification."
+            )
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
@@ -282,6 +470,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
+        target_probs_for_log = None
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
@@ -296,6 +485,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
+            # Compute probabilities for logging in greedy case
+            target_logits_reshaped = logits_output.next_token_logits.reshape(bs, self.draft_token_num, -1)
+            target_probs_for_log = F.softmax(target_logits_reshaped, dim=-1)
 
         else:
             # apply temperature and get target probs
@@ -320,6 +512,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     ),
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
+            target_probs_for_log = target_probs
 
             draft_probs = torch.zeros(
                 target_probs.shape, dtype=torch.float32, device=batch.device
@@ -366,6 +559,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         predict_cpu = predict.tolist()
         has_finished = False
 
+        # Save output_ids before modification for logging
+        prev_output_ids_list = [list(req.output_ids) for req in batch.reqs]
+
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
@@ -402,6 +598,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
+
+        # Save accept_index before it gets modified
+        accept_index_for_log = accept_index.clone()
+
+        # Print detailed verification information for each request
+        # Only print in decode phase, not in prefill phase
+        # Check if this is a decode phase (not prefill-only)
+        # Skip printing if this is a prefill-only batch
+        is_prefill_only = getattr(batch, 'is_prefill_only', False)
+        is_decode_phase = (
+            not batch.forward_mode.is_idle()
+            and not is_prefill_only
+            and (
+                batch.forward_mode.is_decode()
+                or batch.forward_mode == ForwardMode.TARGET_VERIFY
+                or (hasattr(batch, 'forward_mode') and not batch.forward_mode.is_extend())
+            )
+        )
+        
+        if is_decode_phase:
+            self._print_verification_details(
+                batch=batch,
+                candidates=candidates,
+                accept_index=accept_index_for_log,
+                accept_length=accept_length,
+                predict=predict,
+                target_probs=target_probs_for_log,
+                prev_output_ids_list=prev_output_ids_list,
+            )
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them

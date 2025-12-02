@@ -49,6 +49,7 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     select_top_k_tokens,
 )
+from sglang.srt.speculative.validation_logger import SpecValidationLogger
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -92,6 +93,8 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.validation_logger = SpecValidationLogger()
+        self._static_vocab_inverse_map: Optional[dict[int, int]] = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -140,6 +143,8 @@ class EAGLEWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
 
+            self._static_vocab_inverse_map = self._build_static_vocab_inverse_map()
+
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
@@ -186,6 +191,15 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+    def _build_static_vocab_inverse_map(self) -> Optional[dict[int, int]]:
+        config = getattr(self, "model_config", None)
+        if config is None or not getattr(config, "use_static_vocab", False):
+            return None
+        indices = getattr(config, "static_vocab_indices", None)
+        if not indices:
+            return None
+        return {int(token_id): idx for idx, token_id in enumerate(indices)}
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -621,6 +635,10 @@ class EAGLEWorker(TpModelWorker):
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+
+            if logits_output.static_vocab_token_ids is not None:
+                topk_index = logits_output.static_vocab_token_ids[topk_index]
+
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -749,6 +767,8 @@ class EAGLEWorker(TpModelWorker):
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
+        self._log_validation_results(batch, spec_info, res)
+
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
@@ -756,6 +776,113 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = res.draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
+
+    def _log_validation_results(
+        self,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        res: EagleVerifyOutput,
+    ) -> None:
+        if batch.batch_size() == 0 or spec_info.draft_token.numel() == 0:
+            return
+
+        tokens_per_req = spec_info.draft_token_num
+        if tokens_per_req <= 0:
+            return
+
+        try:
+            draft_tokens = spec_info.draft_token.view(
+                batch.batch_size(), tokens_per_req
+            )
+        except RuntimeError:
+            logger.debug("Unable to reshape draft tokens for validation logging.")
+            return
+
+        draft_tokens_cpu = draft_tokens.detach().to("cpu")
+        target_ids_cpu = (
+            res.verified_id.detach().to("cpu")
+            if res.verified_id.numel() > 0
+            else torch.empty(0, dtype=torch.long)
+        )
+
+        ptr = 0
+        inverse_map = self._static_vocab_inverse_map
+
+        for idx, req in enumerate(batch.reqs):
+            if idx >= draft_tokens_cpu.shape[0]:
+                break
+
+            token_row = draft_tokens_cpu[idx].tolist()
+            draft_original_ids = (
+                [int(t) for t in token_row[1:]] if len(token_row) > 1 else []
+            )
+            if inverse_map:
+                draft_reduced_ids = [
+                    inverse_map.get(token_id) for token_id in draft_original_ids
+                ]
+            else:
+                draft_reduced_ids = None
+
+            accept_len = 0
+            if idx < len(res.accept_length_per_req_cpu):
+                accept_len = int(res.accept_length_per_req_cpu[idx])
+            target_len = min(len(target_ids_cpu) - ptr, max(accept_len + 1, 0))
+            target_slice = target_ids_cpu[ptr : ptr + target_len]
+            ptr += target_len
+            target_original_ids = [int(t) for t in target_slice.tolist()]
+
+            result = "accept" if accept_len >= self.speculative_num_steps else "reject"
+            target_tokens_text = (
+                self._convert_ids_to_tokens(req.tokenizer, target_original_ids)
+                if result == "reject"
+                else []
+            )
+            target_original_ids_log = target_original_ids if result == "reject" else []
+
+            prompt_with_context = self._build_prompt_with_context(req)
+
+            entry = {
+                "sample_id": req.rid,
+                "prompt_original": req.origin_input_text,
+                "prompt": prompt_with_context or req.origin_input_text,
+                "draft_generated_tokens": self._convert_ids_to_tokens(
+                    req.tokenizer, draft_original_ids
+                )
+                or [],
+                "draft_generated_original_ids": draft_original_ids,
+                "draft_generated_reduced_ids": draft_reduced_ids,
+                "target_validation_result": result,
+                "target_regenerated_tokens": target_tokens_text,
+                "target_regenerated_original_ids": target_original_ids_log,
+            }
+
+            self.validation_logger.log(entry)
+
+    @staticmethod
+    def _convert_ids_to_tokens(tokenizer, token_ids: List[int]) -> Optional[List[str]]:
+        if tokenizer is None or token_ids is None:
+            return None
+        try:
+            return tokenizer.convert_ids_to_tokens(token_ids)
+        except Exception as exc:  # pragma: no cover - best effort logging
+            logger.debug("Failed to convert token ids for logging: %s", exc)
+            return None
+
+    @staticmethod
+    def _decode_ids(tokenizer, token_ids: List[int]) -> Optional[str]:
+        if tokenizer is None or not token_ids:
+            return None
+        try:
+            return tokenizer.decode(token_ids)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("Failed to decode token ids for logging: %s", exc)
+            return None
+
+    def _build_prompt_with_context(self, req) -> Optional[str]:
+        origin_ids = list(req.origin_input_ids)
+        context_ids = origin_ids + req.output_ids
+        decoded = self._decode_ids(req.tokenizer, context_ids)
+        return decoded
 
     def add_logprob_values(
         self,
@@ -981,7 +1108,16 @@ class EAGLEWorker(TpModelWorker):
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+
+        mapping = logits_output.static_vocab_token_ids
+        if mapping is not None:
+            if mapping.device != topk_index.device:
+                mapping = mapping.to(topk_index.device)
+            topk_index = mapping[topk_index]
+
+        draft_input.topk_p = topk_p
+        draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
 
 

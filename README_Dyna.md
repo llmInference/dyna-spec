@@ -100,13 +100,13 @@ class LlamaForCausalLM(nn.Module):
 ---
 
 
-##### **附加需求：基于 OpenWebText 语料按出现率生成静态词汇表（新增）**
+##### **附加需求：基于 SlimPajama 语料按出现率生成静态词汇表（新增）**
 
-为方便批量构建并复用高频词元集合，我们新增一项明确需求：提供一个独立的工具（或脚本），用于从 OpenWebText 数据集中按 token 出现频率，生成给定大小 k 的静态词汇表文件（模型 token id，按频率从高到低排序，每行一个整数）。该文件可直接作为 `--speculative-static-vocab-path` / `custom_vocab_path` 的输入。
+为方便批量构建并复用高频词元集合，我们新增一项明确需求：提供一个独立的工具（或脚本），用于从 SlimPajama 语料库中按 token 出现频率，生成给定大小 k 的静态词汇表文件（模型 token id，按频率从高到低排序，每行一个整数）。该文件可直接作为 `--speculative-static-vocab-path` / `custom_vocab_path` 的输入。
 
 合同（Contract）
 - 输入：
-    - OpenWebText 数据集标识或 manifest（HuggingFace ID `openwebtext`，或可流式读取的本地切片）。
+    - SlimPajama 语料路径（文件或目录，支持多文件流式读取）。
     - 模型分词器（tokenizer）的路径或名称（用于将文本分词并获得 token id）。
     - 目标词表大小 k（正整数，表示输出前 k 个最频繁的 token id）。
     - 输出路径（plain text 文件），每行包含一个 token id。
@@ -130,9 +130,9 @@ class LlamaForCausalLM(nn.Module):
 - 若语料中有效 token id 总数小于 k，则输出所有可用 token id（按频率排序）。
 
 实现要点（建议）
-    - 使用模型对应的 HuggingFace tokenizer（或等效的 tokenizer API）将文本分割为 token ids。例如：
-        - 调用 tokenizer.encode / tokenizer.__call__（注意设置 return_tensors=None，禁用添加 BOS/EOS，视情况关闭 truncation）。
-        - 为避免内存峰值，使用 HuggingFace streaming API 与分批（batch）分词；对大型语料（如 OpenWebText）建议逐文件、逐行或按固定字节块分割处理。
+- 使用模型对应的 HuggingFace tokenizer（或等效的 tokenizer API）将文本分割为 token ids。例如：
+    - 调用 tokenizer.encode / tokenizer.__call__（注意设置 return_tensors=None，禁用添加 BOS/EOS，视情况关闭 truncation）。
+    - 为避免内存峰值，使用流式读取与分批（batch）分词；对大型语料（如 SlimPajama）建议逐文件、逐行或按固定字节块分割处理。
 - 采用高效计数器（例如 Python 的 collections.Counter 或 numpy 聚合）来统计每个 token id 的出现次数；计数过程中跳过非整数或超出范围的 token id。
 - 最后基于计数器选择前 k 个 token id（按出现次数降序），若出现次数相同，可按 token id 升序作为次级排序保证确定性。
 - 输出时写入临时文件并 atomic rename，避免中途失败导致不完整文件。
@@ -140,14 +140,13 @@ class LlamaForCausalLM(nn.Module):
 CLI 示例（建议）
 
 ```
-python reducedVocab/stream_slimpajama_vocab.py \
-    --dataset openwebtext \
-    --tokenizer Qwen/Qwen3-4B \
-    --freq-output /tmp/token_freq.txt \
-    --vocab-output /tmp/custom_static_vocab.txt \
-    --topk 32000 \
+python scripts/generate_static_vocab_from_slimpajama.py \
+    --tokenizer-path Qwen/Qwen3-4B \
+    --corpus-dir /data/slimpajama \
+    --k 32000 \
+    --output /tmp/custom_static_vocab.txt \
     --batch-size 8192 \
-    --checkpoint /tmp/openwebtext_counter.pkl
+    --workers 4
 ```
 
 最小示例（核心步骤）
@@ -185,53 +184,89 @@ os.replace("/tmp/custom_static_vocab.txt.tmp", "/tmp/custom_static_vocab.txt")
 - 如果需要对多模型支持，允许传入模型 `vocab_size` 参数以便在写入时进行边界检查。
 - 对于多文件和超大语料，建议支持分布式或并行处理以加速统计。
 
+#### 词表精简与验证附加约束（新增）
+
+为保证精简静态词汇表在推测解码与目标模型验证环节的正确性，新增以下约束：
+
+1. 支持乱序的精简词元 ID：
+    - 即使静态词汇表文件内的 token id 不是按原始词表序号排列（乱序或稀疏），系统也应当能够正确构建对应的 `lm_head` 子权重并完成 logits 计算。
+    - 实现建议：加载精简列表（例如 `[101, 3, 502, 17]`），在内存中同时准备两个映射表：
+      - `reduced_index -> original_token_id`（用于把子词表上的采样/索引映射回原始 id），
+      - `original_token_id -> reduced_index`（用于在需要将原始 logits 投影到子空间时做快速索引）。
+
+2. 验证时的 ID 映射语义：
+    - 如果草稿模型输出以“精简词元的 token id”作为验证依据（即草稿模型在子词表空间内直接返回 id），则在将这些 id 发送给目标模型或用于对比前，必须映射回原始全量词表的 token id。举例：若原始词表被精简为 `[1,3,4]`（文件中按行写为 1、3、4），那么子词表内的索引 `0,1,2` 分别对应原始 id `1,3,4`；如果草稿返回子词表 id `1`（表示第二个条目），验证时应将其映回原始 id `3` 再传给目标模型或做 match。
+    - 实现建议：把映射逻辑封装为小工具函数（例如 `map_reduced_ids_to_original(reduced_ids)`），并在验证/比较路径中明确调用以避免混淆。
+
+3. 每次验证记录可审计的日志（放在当前工作目录）：
+    - 对每个验证请求（或每个样本）记录一个结构化条目（建议使用 JSONL），字段至少包含：`sample_id`、`prompt`、`draft_generated_tokens`（字符串数组）、`draft_generated_reduced_ids`（子词表 id 数组，如果有）、`draft_generated_original_ids`（映射回的原始 id 数组）、`target_validation_result`（accept/reject）、以及当 `reject` 时 `target_regenerated_tokens` 和对应的 id 列表。
+    - 文件命名建议：`validation_log.YYYYMMDD_HHMMSS.jsonl`，便于归档与回溯。
+    - 这些日志将帮助诊断是否因为精简词表导致拒绝（即目标模型缺失关键 token）或只是草稿生成不稳定所致。
+
+示例 JSONL 条目（单行）：
+
+```json
+{
+  "sample_id": 42,
+  "prompt": "患者，男，45 岁...",
+  "draft_generated_tokens": ["入院", "后"],
+  "draft_generated_reduced_ids": [5, 6],
+  "draft_generated_original_ids": [101, 502],
+  "target_validation_result": "reject",
+  "target_regenerated_tokens": ["入院后"],
+  "target_regenerated_original_ids": [101, 502]
+}
+```
+
+上述新约束旨在保证：即便静态词表是经过挑选并且 token id 在文件中是乱序的，整个生成→映射→验证→日志的闭环仍能正确工作，且验证所用的一切 id 都能被映回原词表以避免验证误判。
+
 用途
 - 生成的文件可直接作为 `--speculative-static-vocab-path` 或模型配置中的 `custom_vocab_path` 传入，从而在草稿模型中启用词汇表裁剪，显著减少 LM head 的计算量并提高草稿模型速度。
 
 ###### **流式下载 & 分片统计 (进一步约束)**
 
-考虑到 OpenWebText 数据集体量仍然很大（数百 GB 级），一次性下载再处理并不现实。我们要求工具支持“边下载、边分词、边计数”的流式模式，流程如下：
+考虑到 SlimPajama 体量极大（数 TB 级），在单机上完整落盘再统计既耗时又占空间。我们要求工具支持“边下载、边分词、边计数”的流式模式，流程如下：
 
 1. **输入**：
-   - HuggingFace 公开数据集 `openwebtext`（支持 `datasets.load_dataset(..., streaming=True)`），或者你预先复制到本地的切片目录。
+   - 分片 URL 列表或脚本可推导出的远程路径（可来自 SlimPajama 官方 manifest）。
    - 草稿模型的分词器（与主模型保持一致）。
-   - 可配置的批次大小 / tokenizer 并发，以及 shard 参数（如 `--shard-total`）以并行处理多个流。
+   - 可配置的分片大小 / 缓冲区（例如按文件、按 N MB 块）。
    - 目标输出：
-       - ① 原始频次文件 `token_freq.txt`（按出现频率降序列出 `token_id	count`）。
+       - ① 原始频次文件 `token_freq.txt`（按出现频率降序列出 `token_id\tcount`）。
        - ② 静态词汇表 `custom_static_vocab.txt`（在频次表基础上取前 k 个 token id，再按数值升序写入，每行一个 id）。
 
 2. **处理循环（伪流程）**：
 
 ```
-dataset = datasets.load_dataset("openwebtext", split="train", streaming=True)
-if shard_total > 1:
-    dataset = dataset.shard(num_shards=shard_total, index=shard_index)
-for batch in chunk_stream(dataset, batch_size):
-    token_ids = tokenizer(batch, add_special_tokens=False)["input_ids"]
-    counter.update(flatten(token_ids))
-    maybe_checkpoint(counter)
+for shard in manifest:
+    stream = open_remote(shard)        # 使用 HTTP Range / S3 / GCS API
+    for payload in chunk(stream, max_bytes=chunk_size):
+        texts = parse(payload)         # 解析 JSONL/Parquet 行
+        token_ids = tokenizer(texts)   # add_special_tokens=False
+        counter.update(token_ids)
+    flush_checkpoint(counter)          # 可选：周期性保存中间结果
 ```
 
 3. **中间状态与容错**：
-   - 计数器可每处理 N 行就持久化（例如写入 `counts.tmp.pkl`），以便失败后恢复。
-   - 支持断点恢复：记录 `--checkpoint` 的路径并保留已完成的 shard index，重新启动时可以跳过已完成的 shard。
+   - 计数器可每处理 N 行/文件就持久化（例如写入 `counts.temp.json`），以便失败后恢复。
+   - 支持断点恢复：记录已完成分片 ID，重启时跳过。
 
 4. **输出阶段**：
-   - `token_freq.txt`: 记录 `Counter.most_common()` 的结果；若文件过大，可直接写出 `token_id	count` 并按 count 降序。
+   - `token_freq.txt`: `most_common()` 结果；若文件过大，可写入 `token_id\tcount` 并按 count 降序。
    - `custom_static_vocab.txt`: 读取频次文件、取前 k 个、过滤越界 id、按 token id 升序输出（同前述要求）。
-   - 可选再提供 `sort -n` 或 `python -c "..."` 等方式方便二次排序。
+   - 可选再提供 `sort -n` 命令或 `heapq.nsmallest`，以便用户自定义排序方式。
 
 5. **CLI 示例**：
 
 ```
-python reducedVocab/stream_slimpajama_vocab.py \
-  --dataset openwebtext \
+python scripts/stream_slimpajama_vocab.py \
+  --manifest s3://datasets/slimpajama/manifest.json \
   --tokenizer Qwen/Qwen3-4B \
-  --shard-total 4 \
+  --chunk-size-mb 128 \
   --topk 32000 \
   --freq-output /tmp/token_freq.txt \
   --vocab-output /tmp/custom_static_vocab.txt \
-  --checkpoint /tmp/openwebtext_counter.chkpt
+  --resume-cache /tmp/slim_counter.chkpt
 ```
 
 这样我们无需一次性下载完整语料，只需保证网络带宽可持续即可。统计结果（频次表 + 排序后的静态词表）可直接复用在草稿模型的静态词汇功能中。

@@ -12,7 +12,6 @@ This folder hosts scripts that implement the requirement documented in `README_D
 | --- | --- |
 | `stream_slimpajama_vocab.py` | Streams SlimPajama, tokenizes with a user-provided tokenizer, maintains token frequency counts, and writes both a frequency file and a sorted static vocabulary (top-k token IDs). Supports dataset sharding, checkpoint resume, and optional GPU-accelerated `torch.bincount`. |
 | `merge_token_freq.py` | Utility that merges multiple frequency files (e.g., from parallel runs) and optionally emits a final static vocab file. |
-| `sample_token_freq_subset.py` | Samples a subset (e.g., top 10%) of an existing `token_freq` file and writes new freq/vocab artifacts—handy for creating SlimPajama-derived subsets under `freq/`. |
 
 ## Quick Start
 
@@ -36,7 +35,7 @@ The script:
 2. Tokenizes batches of records using the specified tokenizer (matching the draft model).
 3. Updates a global `Counter` and, optionally, checkpoints it to disk for resuming.
 4. Writes:
-  - `token_freq.txt`: `token_id\tcount\ttoken_text`, sorted by frequency (desc) then token id (asc). `token_text` is escaped (e.g. `\n`, `\t`) so you can grep it safely.
+   - `token_freq.txt`: `token_id\tcount`, sorted by frequency (desc) then token id (asc).
    - `custom_static_vocab.txt`: top-k token IDs filtered to valid vocab range and sorted ascending, one per line.
 
 ### Parallelizing across shards
@@ -80,7 +79,7 @@ python reducedVocab/merge_token_freq.py \
   --tokenizer Qwen/Qwen3-4B
 ```
 
-`merge_token_freq.py` aggregates counts (summing duplicate token IDs), preserves the descending frequency order, and optionally writes the final static vocab (ascending token IDs) when tokenizer info is provided. Pass `--annotate-token-text --tokenizer ...` if you also want the merged freq file to carry the decoded token strings.
+`merge_token_freq.py` aggregates counts (summing duplicate token IDs), preserves the descending frequency order, and optionally writes the final static vocab (ascending token IDs) when tokenizer info is provided.
 
 ### Automated shard orchestration
 
@@ -97,24 +96,6 @@ python reducedVocab/run_parallel_slimpajama.py \
 
 The script writes one log per shard inside `--log-dir` (default `logs/`), names frequency/vocab/checkpoint files with the shard index, and runs `merge_token_freq.py` to produce the consolidated outputs if `--merge` is supplied.
 It defaults to `Skylion007/openwebtext`, so the example above already streams OpenWebText unless you override `--dataset`.
-
-### Sampling a SlimPajama subset into `freq/`
-
-当你已经拿到了 SlimPajama 的全量 `token_freq` / `custom_static_vocab` 文件时，可以使用 `sample_token_freq_subset.py` 快速抽取 10%（或任意比例）的子集，并直接写入仓库里的 `freq/` 目录，方便和 OpenWebText 结果做对比：
-
-```bash
-python reducedVocab/sample_token_freq_subset.py \
-  --input freq/token_freq_slimpajama_full.txt \
-  --output freq/token_freq_slimpajama_top10pct.txt \
-  --vocab-output freq/custom_static_vocab_slimpajama_top10pct.txt \
-  --ratio 0.1 \
-  --strategy top \
-  --tokenizer Qwen/Qwen3-1.7B
-```
-
-- `--ratio` 控制抽样比例（0-1，默认 0.1）。`--strategy top` 表示保留频率最高的前 10%，也可以改成 `random` 并通过 `--seed` 固定采样。
-- 输出文件名可以自定义，只需前缀成 `freq/token_freq_xxx.txt` / `freq/custom_static_vocab_xxx.txt`，以便与 OpenWebText 版本区分。
-- 若输入文件已有第三列 token 文本，脚本会原样保留；如需重新解码，请提供 `--tokenizer`（会利用 `unicode_escape` 形式写入，便于 grep）。
 
 ## Notes
 

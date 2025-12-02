@@ -313,6 +313,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             probs = torch.softmax(ret.next_token_logits, dim=-1)
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
+            if ret.static_vocab_token_ids is not None:
+                ret.topk_index = ret.static_vocab_token_ids[ret.topk_index]
+            if self.eagle_worker.hot_token_id is not None:
+                ret.topk_index = self.eagle_worker.hot_token_id[ret.topk_index]
+
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret

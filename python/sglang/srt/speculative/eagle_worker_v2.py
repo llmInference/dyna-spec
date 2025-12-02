@@ -34,6 +34,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     load_token_map,
 )
+from sglang.srt.speculative.validation_logger import SpecValidationLogger
 from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
@@ -364,6 +365,11 @@ class EagleDraftWorker(BaseDraftWorker):
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            mapping = logits_output.static_vocab_token_ids
+            if mapping is not None:
+                if mapping.device != topk_index.device:
+                    mapping = mapping.to(topk_index.device)
+                topk_index = mapping[topk_index]
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -434,6 +440,12 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
             probs, self.topk, dim=-1
         )
+        mapping = logits_output.static_vocab_token_ids
+        if mapping is not None:
+            map_tensor = mapping
+            if mapping.device != next_draft_input.topk_index.device:
+                map_tensor = mapping.to(next_draft_input.topk_index.device)
+            next_draft_input.topk_index = map_tensor[next_draft_input.topk_index]
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
@@ -479,6 +491,12 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
         probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        mapping = draft_logits_output.static_vocab_token_ids
+        if mapping is not None:
+            map_tensor = mapping
+            if mapping.device != ret_topk_index.device:
+                map_tensor = mapping.to(ret_topk_index.device)
+            ret_topk_index = map_tensor[ret_topk_index]
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -518,6 +536,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.validation_logger = SpecValidationLogger()
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -530,6 +549,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
         )
 
+        self._static_vocab_inverse_map: Optional[dict[int, int]] = (
+            self._build_static_vocab_inverse_map()
+        )
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -537,6 +560,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def _build_static_vocab_inverse_map(self) -> Optional[dict[int, int]]:
+        config = getattr(self.draft_worker.draft_runner, "model_config", None)
+        if config is None or not getattr(config, "use_static_vocab", False):
+            return None
+        indices = getattr(config, "static_vocab_indices", None)
+        if not indices:
+            return None
+        return {int(token_id): idx for idx, token_id in enumerate(indices)}
 
     @property
     def target_worker(self):

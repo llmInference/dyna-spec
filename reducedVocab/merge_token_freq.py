@@ -7,7 +7,6 @@ import logging
 import os
 from collections import Counter
 from pathlib import Path
-from typing import Optional
 
 from tqdm import tqdm
 
@@ -17,16 +16,6 @@ except ImportError:
     AutoTokenizer = None  # type: ignore
 
 logger = logging.getLogger(__name__)
-
-
-def _format_token_text(tokenizer, token_id: int) -> str:
-    try:
-        token = tokenizer.convert_ids_to_tokens([token_id])[0]
-    except Exception:  # pragma: no cover - tokenizer-specific edge cases
-        token = None
-    if token is None:
-        return "<unk>"
-    return token.encode("unicode_escape").decode("utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,11 +35,6 @@ def parse_args() -> argparse.Namespace:
         help="Path to write the merged frequency file.",
     )
     parser.add_argument(
-        "--annotate-token-text",
-        action="store_true",
-        help="When set, include a third column with decoded token text (requires --tokenizer).",
-    )
-    parser.add_argument(
         "--vocab-output",
         default=None,
         help="Optional path to write a static vocab (top-k ids sorted ascending).",
@@ -64,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer",
         default=None,
-        help="Tokenizer name/path for vocab size validation or token annotation (required if --vocab-output or --annotate-token-text is set).",
+        help="Tokenizer name/path for vocab size validation (required if --vocab-output is set).",
     )
     parser.add_argument(
         "--local-files-only",
@@ -82,29 +66,22 @@ def load_freq_file(path: str) -> Counter:
             if not line:
                 continue
             try:
-                parts = line.split("\t")
-                token_str, count_str = parts[0], parts[1]
+                token_str, count_str = line.split("\t")
                 token_id = int(token_str)
                 count = int(count_str)
-            except (ValueError, IndexError):
+            except ValueError:
                 logger.warning("Skipping malformed line in %s: %s", path, line)
                 continue
             counter[token_id] += count
     return counter
 
 
-def write_frequency_file(
-    counter: Counter, path: str, tokenizer=None, include_token_text: bool = False
-) -> None:
+def write_frequency_file(counter: Counter, path: str) -> None:
     freq_lines = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for token_id, count in freq_lines:
-            if include_token_text and tokenizer is not None:
-                token_text = _format_token_text(tokenizer, token_id)
-                f.write(f"{token_id}\t{count}\t{token_text}\n")
-            else:
-                f.write(f"{token_id}\t{count}\n")
+            f.write(f"{token_id}\t{count}\n")
 
 
 def write_vocab(
@@ -136,30 +113,11 @@ def main() -> None:
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
     )
-    if args.annotate_token_text and args.tokenizer is None:
-        raise ValueError("--tokenizer is required when --annotate-token-text is set.")
     merged_counter: Counter = Counter()
     for path in tqdm(args.inputs, desc="Merging freq files"):
         merged_counter.update(load_freq_file(path))
     logger.info("Writing merged frequency file to %s", args.output)
-    annotation_tokenizer = None
-    if args.annotate_token_text:
-        if AutoTokenizer is None:
-            raise SystemExit(
-                "transformers is required when --annotate-token-text is set."
-            )
-        annotation_tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer,
-            use_fast=True,
-            trust_remote_code=False,
-            local_files_only=args.local_files_only,
-        )
-    write_frequency_file(
-        merged_counter,
-        args.output,
-        tokenizer=annotation_tokenizer,
-        include_token_text=args.annotate_token_text,
-    )
+    write_frequency_file(merged_counter, args.output)
 
     if args.vocab_output:
         if args.topk is None or args.tokenizer is None:

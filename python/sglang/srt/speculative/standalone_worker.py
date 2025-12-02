@@ -9,6 +9,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
+from sglang.srt.speculative.validation_logger import SpecValidationLogger
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -43,6 +44,8 @@ class StandaloneWorker(EAGLEWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.validation_logger = SpecValidationLogger()
+        self._static_vocab_inverse_map = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -100,3 +103,4 @@ class StandaloneWorker(EAGLEWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        self._static_vocab_inverse_map = self._build_static_vocab_inverse_map()

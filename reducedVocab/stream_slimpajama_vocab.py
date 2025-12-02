@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stream OpenWebText, tokenize with a draft tokenizer, and export frequency + static vocab files.
 
-The script follows the requirements laid out in README_Dyna.md "附加需求：基于 OpenWebText 语料按出现率生成静态词汇表".
+The script follows the requirements laid out in README_Dyna.md "附加需求：基于大语料按出现率生成静态词汇表" but now defaults to OpenWebText for faster experimentation.
 """
 from __future__ import annotations
 
@@ -29,13 +29,19 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream OpenWebText, count token frequencies, and emit static vocab files.",
+        description="Stream SlimPajama, count token frequencies, and emit static vocab files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--dataset",
-        default="openwebtext",
+        default="Skylion007/openwebtext",
         help="HuggingFace dataset repo id (supports streaming).",
+    )
+    parser.add_argument(
+        "--trust-dataset-code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass trust_remote_code to datasets.load_dataset (needed for community datasets like OpenWebText).",
     )
     parser.add_argument(
         "--split",
@@ -179,6 +185,7 @@ def stream_dataset(
     split: str,
     revision: Optional[str],
     hf_token: Optional[str],
+    trust_remote_code: bool,
 ) -> datasets.iterable_dataset.IterableDataset:
     ds = datasets.load_dataset(
         dataset,
@@ -186,6 +193,7 @@ def stream_dataset(
         streaming=True,
         revision=revision,
         use_auth_token=hf_token,
+        trust_remote_code=trust_remote_code,
     )
     return ds
 
@@ -274,7 +282,11 @@ def main() -> None:
 
     counter = load_counter(args.checkpoint)
     dataset_stream = stream_dataset(
-        args.dataset, args.split, args.revision, args.hf_token
+        args.dataset,
+        args.split,
+        args.revision,
+        args.hf_token,
+        args.trust_dataset_code,
     )
     if args.shard_total > 1:
         dataset_stream = dataset_stream.shard(

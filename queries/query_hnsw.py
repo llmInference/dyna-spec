@@ -13,5 +13,4 @@ def get_hnsw_similar_words(query, k):
     query_array = np.array([query])
     dis, idx = index.search(query_array, k)
     # idx: index in embed_tokens_weight
-    return lookup[idx[0]]
-
+    return idx[0]

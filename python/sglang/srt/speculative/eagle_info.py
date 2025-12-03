@@ -2,9 +2,30 @@ import logging
 from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
+import threading
 
 import torch
 import torch.nn.functional as F
+
+# for queries access
+import sys
+import os
+import numpy as np
+
+project_root = os.path.join(os.path.dirname(__file__), '../../../..')
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+from queries.query_hnsw import get_hnsw_similar_words
+from queries.query_graph import get_co_occurrence
+
+lookup = np.load("./generated/lookup.npy") # token_id -> token
+
+import requests
+import json
+
+
+# end
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -279,16 +300,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             print("\n" + "="*60)
             if rejection_layer < self.draft_token_num:
                 print(f"Draft Failed at Layer {rejection_layer}.")
-                # Call failure analysis
-                self._handle_failure(
-                    batch=batch,
-                    req_index=i,
-                    rejection_layer=rejection_layer,
-                    candidates=candidates,
-                    target_probs=target_probs,
-                    accept_index=accept_index,
-                    predict=predict,
-                )
+                # Invoke handler to add words asynchronously
+                def run_handle_failure():
+                    try:
+                        self._handle_failure(
+                            batch=batch,
+                            req_index=i,
+                            rejection_layer=rejection_layer,
+                            candidates=candidates,
+                            target_probs=target_probs,
+                            accept_index=accept_index,
+                            predict=predict,
+                        )
+                    except Exception as e:
+                        logger.exception(f"Error in async failure handling: {e}")
+                thread = threading.Thread(target=run_handle_failure, daemon=True)
+                thread.start()
             else:
                 print(f"Draft Accepted All {self.draft_token_num} Tokens.")
             
@@ -379,15 +406,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             predict: Target model predictions (flat tensor)
         """
         # Get tokenizer if available
-        tokenizer = getattr(batch.reqs[req_index], 'tokenizer', None)
-        if tokenizer is None:
-            tokenizer = getattr(batch, 'tokenizer', None)
+        # tokenizer = getattr(batch.reqs[req_index], 'tokenizer', None)
+        # if tokenizer is None:
+        #     tokenizer = getattr(batch, 'tokenizer', None)
         
-        print("\n" + "="*60)
-        print(f"FAILURE ANALYSIS for Request {req_index} at Layer {rejection_layer}")
-        print("="*60)
+        # print("\n" + "="*60)
+        # print(f"FAILURE ANALYSIS for Request {req_index} at Layer {rejection_layer}")
+        # print("="*60)
         
-        # 1. Get top_k tokens from target model at failure point
+        # 1. Get top_k
+        top_k = []
         if target_probs is not None and rejection_layer < self.draft_token_num:
             # target_probs shape: (bs, draft_token_num, vocab_size)
             probs_at_failure = target_probs[req_index, rejection_layer]
@@ -399,18 +427,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             print(f"\nTop-{topk} tokens from Target Model at failure layer {rejection_layer}:")
             for k in range(topk):
                 token_id = top_token_ids[k].item()
-                prob = top_probs[k].item()
-                token_text = ""
-                if tokenizer is not None:
-                    try:
-                        token_text = tokenizer.decode([token_id])
-                    except Exception as e:
-                        token_text = f"Token {token_id}"
-                else:
-                    token_text = f"Token {token_id}"
-                print(f"  {k+1}. {token_text} (prob: {prob:.4f})")
-        
-        # 2. Get last hidden state at failure point
+                top_k.append(token_id)
+
+        # 2. Get last hidden state
         if hasattr(batch, 'spec_info') and hasattr(batch.spec_info, 'hidden_states'):
             hidden_states = batch.spec_info.hidden_states
             # hidden_states shape: (num_tokens, hidden_size)
@@ -419,17 +438,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             if rejection_layer < self.draft_token_num:
                 flat_index = req_index * self.draft_token_num + rejection_layer
                 if flat_index < hidden_states.shape[0]:
-                    hidden_state = hidden_states[flat_index]
-                    # Print summary of hidden state
-                    print(f"\nHidden State at failure point (shape: {hidden_state.shape}):")
-                    print(f"  Mean: {hidden_state.mean().item():.6f}")
-                    print(f"  Std: {hidden_state.std().item():.6f}")
-                    print(f"  Min: {hidden_state.min().item():.6f}")
-                    print(f"  Max: {hidden_state.max().item():.6f}")
-                    
-                    # Optionally print first few values
-                    if hidden_state.shape[0] > 0:
-                        print(f"  First 5 values: {hidden_state[:5].cpu().tolist()}")
+                    last_hidden_state = hidden_states[flat_index].cpu().numpy()
+
                 else:
                     print(f"\nHidden State not available at index {flat_index}")
             else:
@@ -437,20 +447,39 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         else:
             print(f"\nHidden State not available in batch.spec_info")
         
-        # 3. Print draft token that failed
-        if rejection_layer < candidates.shape[1]:
-            draft_token_id = candidates[req_index, rejection_layer].item()
-            draft_token_text = ""
-            if tokenizer is not None:
-                try:
-                    draft_token_text = tokenizer.decode([draft_token_id])
-                except Exception as e:
-                    draft_token_text = f"Token {draft_token_id}"
-            else:
-                draft_token_text = f"Token {draft_token_id}"
-            print(f"\nDraft Token at failure layer: {draft_token_text}")
+        # # 3. Print draft token that failed
+        # if rejection_layer < candidates.shape[1]:
+        #     draft_token_id = candidates[req_index, rejection_layer].item()
+        #     draft_token_text = ""
+        #     if tokenizer is not None:
+        #         try:
+        #             draft_token_text = tokenizer.decode([draft_token_id])
+        #         except Exception as e:
+        #             draft_token_text = f"Token {draft_token_id}"
+        #     else:
+        #         draft_token_text = f"Token {draft_token_id}"
+        #     print(f"\nDraft Token at failure layer: {draft_token_text}")
         
-        print("="*60 + "\n")
+        # print("="*60 + "\n")
+
+        # Query and get C_final
+        hnsw_result = get_hnsw_similar_words(last_hidden_state, 10)
+        C_initial = list(set(top_k + hnsw_result))
+
+        C_co_occurrence = []
+        for token in C_initial:
+            C_co_occurrence.extend(get_co_occurrence(token))
+        
+        C_final = list(set(C_initial + C_co_occurrence))
+
+        # Add to dyna vocab
+        url = "http://127.0.0.1:30000/v1/vocab/add"
+        headers = {"Content-Type": "application/json"}
+        C_final_words = [lookup[idx] for idx in C_final]
+        data = {"words": C_final_words}
+        print("✨ Adding words to dyna vocab: " + C_final_words)
+        
+        response = requests.post(url, headers=headers, json=data)
 
 
     def verify(

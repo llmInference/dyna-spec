@@ -279,6 +279,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             print("\n" + "="*60)
             if rejection_layer < self.draft_token_num:
                 print(f"Draft Failed at Layer {rejection_layer}.")
+                # Call failure analysis
+                self._handle_failure(
+                    batch=batch,
+                    req_index=i,
+                    rejection_layer=rejection_layer,
+                    candidates=candidates,
+                    target_probs=target_probs,
+                    accept_index=accept_index,
+                    predict=predict,
+                )
             else:
                 print(f"Draft Accepted All {self.draft_token_num} Tokens.")
             
@@ -346,6 +356,102 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 print(f"Analyze: Draft predicted '{draft_pred_text}', but Target wanted '{target_wanted_text}'.")
             
             print("="*60 + "\n")
+
+    def _handle_failure(
+        self,
+        batch: ScheduleBatch,
+        req_index: int,
+        rejection_layer: int,
+        candidates: torch.Tensor,
+        target_probs: Optional[torch.Tensor] = None,
+        accept_index: Optional[torch.Tensor] = None,
+        predict: Optional[torch.Tensor] = None,
+    ):
+        """Handle failure analysis for a specific request.
+        
+        Args:
+            batch: The schedule batch
+            req_index: Index of the request in the batch
+            rejection_layer: The layer where draft failed (0-indexed)
+            candidates: Draft tokens (bs, draft_token_num)
+            target_probs: Target model probabilities (bs, draft_token_num, vocab_size)
+            accept_index: Accepted indices (bs, spec_steps+1)
+            predict: Target model predictions (flat tensor)
+        """
+        # Get tokenizer if available
+        tokenizer = getattr(batch.reqs[req_index], 'tokenizer', None)
+        if tokenizer is None:
+            tokenizer = getattr(batch, 'tokenizer', None)
+        
+        print("\n" + "="*60)
+        print(f"FAILURE ANALYSIS for Request {req_index} at Layer {rejection_layer}")
+        print("="*60)
+        
+        # 1. Get top_k tokens from target model at failure point
+        if target_probs is not None and rejection_layer < self.draft_token_num:
+            # target_probs shape: (bs, draft_token_num, vocab_size)
+            probs_at_failure = target_probs[req_index, rejection_layer]
+            
+            # Get top-k probabilities and token ids
+            topk = min(self.topk, probs_at_failure.shape[-1])
+            top_probs, top_token_ids = torch.topk(probs_at_failure, k=topk)
+            
+            print(f"\nTop-{topk} tokens from Target Model at failure layer {rejection_layer}:")
+            for k in range(topk):
+                token_id = top_token_ids[k].item()
+                prob = top_probs[k].item()
+                token_text = ""
+                if tokenizer is not None:
+                    try:
+                        token_text = tokenizer.decode([token_id])
+                    except Exception as e:
+                        token_text = f"Token {token_id}"
+                else:
+                    token_text = f"Token {token_id}"
+                print(f"  {k+1}. {token_text} (prob: {prob:.4f})")
+        
+        # 2. Get last hidden state at failure point
+        if hasattr(batch, 'spec_info') and hasattr(batch.spec_info, 'hidden_states'):
+            hidden_states = batch.spec_info.hidden_states
+            # hidden_states shape: (num_tokens, hidden_size)
+            # where num_tokens = bs * draft_token_num (flattened)
+            # Map (req_index, rejection_layer) to flattened index
+            if rejection_layer < self.draft_token_num:
+                flat_index = req_index * self.draft_token_num + rejection_layer
+                if flat_index < hidden_states.shape[0]:
+                    hidden_state = hidden_states[flat_index]
+                    # Print summary of hidden state
+                    print(f"\nHidden State at failure point (shape: {hidden_state.shape}):")
+                    print(f"  Mean: {hidden_state.mean().item():.6f}")
+                    print(f"  Std: {hidden_state.std().item():.6f}")
+                    print(f"  Min: {hidden_state.min().item():.6f}")
+                    print(f"  Max: {hidden_state.max().item():.6f}")
+                    
+                    # Optionally print first few values
+                    if hidden_state.shape[0] > 0:
+                        print(f"  First 5 values: {hidden_state[:5].cpu().tolist()}")
+                else:
+                    print(f"\nHidden State not available at index {flat_index}")
+            else:
+                print(f"\nHidden State: rejection_layer {rejection_layer} >= draft_token_num {self.draft_token_num}")
+        else:
+            print(f"\nHidden State not available in batch.spec_info")
+        
+        # 3. Print draft token that failed
+        if rejection_layer < candidates.shape[1]:
+            draft_token_id = candidates[req_index, rejection_layer].item()
+            draft_token_text = ""
+            if tokenizer is not None:
+                try:
+                    draft_token_text = tokenizer.decode([draft_token_id])
+                except Exception as e:
+                    draft_token_text = f"Token {draft_token_id}"
+            else:
+                draft_token_text = f"Token {draft_token_id}"
+            print(f"\nDraft Token at failure layer: {draft_token_text}")
+        
+        print("="*60 + "\n")
+
 
     def verify(
         self,

@@ -241,3 +241,8 @@ lmms-eval
 
 **/.claude/
 **/.serena/
+
+# large files generated for hnsw and co-occurence graph search
+hnsw.index
+lookup.npy
+

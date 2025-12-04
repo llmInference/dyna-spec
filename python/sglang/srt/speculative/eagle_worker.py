@@ -650,6 +650,39 @@ class EAGLEWorker(TpModelWorker):
         )
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
+        # If dynamic vocab is enabled for the draft model, map draft candidates
+        # from local dynamic-vocab indices back to global token IDs before
+        # sending them to the target model for verification.
+        if (
+            hasattr(model_worker_batch, "dynamic_vocab_token_ids")
+            and model_worker_batch.dynamic_vocab_token_ids is not None
+        ):
+            dynamic_ids = model_worker_batch.dynamic_vocab_token_ids
+            # Current dynamic vocab implementation for API / client only uses
+            # a single global 1D mapping shared across the batch.
+            if dynamic_ids.dim() == 1:
+                logger.info(
+                    f"previous draft_token[{spec_info.draft_token}] "
+                )
+                logger.info(
+                    f"dynamic_ids[{dynamic_ids.shape}] = {dynamic_ids[:10]}"
+                )
+                dynamic_ids = dynamic_ids.to(device=spec_info.draft_token.device)
+                # spec_info.draft_token is a flat 1D tensor; map element-wise.
+                spec_info.draft_token = dynamic_ids[
+                    spec_info.draft_token.to(dtype=torch.long)
+                ]
+                # If you need debug logs, uncomment the following lines:
+                logger.info(
+                    f"after mapping draft_token[{spec_info.draft_token}] "
+                )
+            else:
+                logger.warning(
+                    "EAGLEWorker.verify: Detected per-request dynamic_vocab_token_ids "
+                    "(>=2D tensor), which is not yet supported in speculative decoding. "
+                    "Draft candidates will be interpreted as global token IDs."
+                )
+
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
             retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()

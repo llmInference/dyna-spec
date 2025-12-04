@@ -150,8 +150,14 @@ class EAGLEWorker(TpModelWorker):
                 and self.draft_model_runner.model.load_lm_head_from_target
             ):
                 self.draft_model_runner.model.set_embed_and_head(embed, head)
+                logger.info(
+                    "EAGLEWorker: EAGLE3 draft model shares embed and lm_head with target model."
+                )
             else:
                 self.draft_model_runner.model.set_embed(embed)
+                logger.info(
+                    "EAGLEWorker: EAGLE3 draft model only shares embed; lm_head is not shared."
+                )
 
             # grab hot token ids
             if self.draft_model_runner.model.hot_token_id is not None:
@@ -167,6 +173,11 @@ class EAGLEWorker(TpModelWorker):
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
+            logger.info(
+                "EAGLEWorker: non-EAGLE3 draft model shares embed and lm_head with target model "
+                "(hot vocab size=%s).",
+                len(self.hot_token_id) if self.hot_token_id is not None else "full vocab",
+            )
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (

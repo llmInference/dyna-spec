@@ -4,6 +4,7 @@ import time
 import uuid
 from typing import List, Optional, Union, Dict, Any
 
+import logging
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -569,6 +570,12 @@ def generate(req: GenerateRequest):
             detail=f"No active vocabulary for client {effective_client_id}",
         )
 
+    # Log first 10 dynamic vocab token IDs for debugging
+    logging.info(
+        "[DynamicVocab] /v1/generate using dynamic_vocab_token_ids "
+        f"(first 10 of {len(active_vocab_ids)}): {active_vocab_ids[:10]}"
+    )
+
     sampling_kwargs = dict(req.sampling_params or {})
     sampling_kwargs["dynamic_vocab_token_ids"] = active_vocab_ids
     if req.max_new_tokens is not None and "max_new_tokens" not in sampling_kwargs:
@@ -604,6 +611,12 @@ def get_hidden_states(req: HiddenStateRequest):
             status_code=400,
             detail=f"No active vocabulary for client {effective_client_id}",
         )
+
+    # Log first 10 dynamic vocab token IDs for debugging
+    logging.info(
+        "[DynamicVocab] /v1/hidden_states using dynamic_vocab_token_ids "
+        f"(first 10 of {len(active_vocab_ids)}): {active_vocab_ids[:10]}"
+    )
 
     sampling_kwargs = dict(req.sampling_params or {})
     sampling_kwargs["dynamic_vocab_token_ids"] = active_vocab_ids
@@ -677,6 +690,11 @@ def chat_completions(req: ChatCompletionRequest):
         _ensure_client_vocab_initialized(req.client_id)
         active_vocab_ids = vocab_manager.get_vocab_list()
         if active_vocab_ids:
+            # Log first 10 dynamic vocab token IDs for debugging
+            logging.info(
+                "[DynamicVocab] /v1/chat/completions using dynamic_vocab_token_ids "
+                f"(first 10 of {len(active_vocab_ids)}): {active_vocab_ids[:10]}"
+            )
             sampling_kwargs["dynamic_vocab_token_ids"] = active_vocab_ids
     
     # Generate response

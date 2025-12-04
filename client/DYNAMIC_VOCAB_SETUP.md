@@ -99,6 +99,13 @@ python3 -m sglang.launch_server \
 
 ## 2. 启动 FastAPI 服务器（管理动态词汇表）
 
+# Log first 10 dynamic vocab token IDs for debugging
+    logging.info(
+        "[DynamicVocab] /v1/generate using dynamic_vocab_token_ids "
+        f"(first 10 of {len(active_vocab_ids)}): {active_vocab_ids[:10]}"
+    )
+
+
 ```bash
 cd /home/llminference/syq/dyna-spec
 export SGLANG_RUNTIME_URL=http://127.0.0.1:30001

@@ -1,0 +1,123 @@
+[2025-12-04 19:49:59] previous draft_token[tensor([ 20,   0,  85, 336], device='cuda:0')] 
+[2025-12-04 19:49:59] dynamic_ids[torch.Size([3000])] = tensor([ 11, 279,  13, 323, 315, 311, 220, 264,  15,  16])
+[2025-12-04 19:49:59] after mapping draft_token[tensor([320,  11, 284,  28], device='cuda:0')] 
+
+============================================================
+Draft Failed at Layer 2.
+
+Context: "5"
+------------------------------------------------------------
+accept_index_row: [0, 1, -1, -1]
+Accepted tokens this round: ", ,"
+❌ Draft Candidates (Top-1 guess):
+   1. " (" (prob: 0.00)
+------------------------------------------------------------
+✅ Target Decision (Bonus Token):
+   -> "," (prob: 0.99)
+------------------------------------------------------------
+Analyze: Draft predicted ' (', but Target wanted ','.
+============================================================
+
+[2025-12-04 19:49:59] previous draft_token[tensor([1154,   34,    0,    6], device='cuda:0')] 
+[2025-12-04 19:49:59] dynamic_ids[torch.Size([3000])] = tensor([ 11, 279,  13, 323, 315, 311, 220, 264,  15,  16])
+[2025-12-04 19:49:59] after mapping draft_token[tensor([4879,   21,   11,  220], device='cuda:0')] 
+
+============================================================
+Draft Failed at Layer 1.
+
+Context: "5, ,"
+------------------------------------------------------------
+accept_index_row: [0, -1, -1, -1]
+Accepted tokens this round: " "
+❌ Draft Candidates (Top-1 guess):
+   1. " release" (prob: 0.00)
+------------------------------------------------------------
+✅ Target Decision (Bonus Token):
+   -> " " (prob: 0.40)
+------------------------------------------------------------
+Analyze: Draft predicted ' release', but Target wanted ' '.
+============================================================
+
+[2025-12-04 19:49:59] previous draft_token[tensor([220,  34,   0,   6], device='cuda:0')] 
+[2025-12-04 19:49:59] dynamic_ids[torch.Size([3000])] = tensor([ 11, 279,  13, 323, 315, 311, 220, 264,  15,  16])
+[2025-12-04 19:49:59] after mapping draft_token[tensor([  4,  21,  11, 220], device='cuda:0')] 
+
+============================================================
+Draft Failed at Layer 1.
+
+Context: "5, , "
+------------------------------------------------------------
+accept_index_row: [0, -1, -1, -1]
+Accepted tokens this round: "1"
+❌ Draft Candidates (Top-1 guess):
+   1. "%" (prob: 0.00)
+------------------------------------------------------------
+✅ Target Decision (Bonus Token):
+   -> "1" (prob: 0.89)
+------------------------------------------------------------
+Analyze: Draft predicted '%', but Target wanted '1'.
+============================================================
+
+[2025-12-04 19:49:59] previous draft_token[tensor([16,  8,  6, 14], device='cuda:0')] 
+[2025-12-04 19:49:59] dynamic_ids[torch.Size([3000])] = tensor([ 11, 279,  13, 323, 315, 311, 220, 264,  15,  16])
+[2025-12-04 19:49:59] after mapping draft_token[tensor([429,  15, 220, 198], device='cuda:0')] 
+
+============================================================
+Draft Failed at Layer 1.
+
+Context: "5, , 1"
+------------------------------------------------------------
+accept_index_row: [0, -1, -1, -1]
+Accepted tokens this round: ","
+❌ Draft Candidates (Top-1 guess):
+   1. " that" (prob: 0.00)
+------------------------------------------------------------
+✅ Target Decision (Bonus Token):
+   -> "," (prob: 0.99)
+------------------------------------------------------------
+Analyze: Draft predicted ' that', but Target wanted ','.
+============================================================
+
+[2025-12-04 19:49:59] previous draft_token[tensor([11, 11, 11,  6], device='cuda:0')] 
+[2025-12-04 19:49:59] dynamic_ids[torch.Size([3000])] = tensor([ 11, 279,  13, 323, 315, 311, 220, 264,  15,  16])
+[2025-12-04 19:49:59] after mapping draft_token[tensor([ 17,  17,  17, 220], device='cuda:0')] 
+
+============================================================
+Draft Failed at Layer 3.
+
+Context: "5, , 1,"
+------------------------------------------------------------
+accept_index_row: [0, 1, 2, -1]
+Accepted tokens this round: "221"
+❌ Draft Candidates (Top-1 guess):
+   1. "2" (prob: 0.00)
+------------------------------------------------------------
+✅ Target Decision (Bonus Token):
+   -> "2" (prob: 0.99)
+------------------------------------------------------------
+Analyze: Draft predicted '2', but Target wanted '2'.
+============================================================
+
+[2025-12-04 19:49:59] previous draft_token[tensor([16,  0,  6,  6], device='cuda:0')] 
+[2025-12-04 19:49:59] dynamic_ids[torch.Size([3000])] = tensor([ 11, 279,  13, 323, 315, 311, 220, 264,  15,  16])
+[2025-12-04 19:49:59] after mapping draft_token[tensor([429,  11, 220, 220], device='cuda:0')] 
+
+============================================================
+Draft Failed at Layer 1.
+
+Context: "5, , 1,221"
+------------------------------------------------------------
+accept_index_row: [0, -1, -1, -1]
+Accepted tokens this round: ","
+❌ Draft Candidates (Top-1 guess):
+   1. " that" (prob: 0.00)
+------------------------------------------------------------
+✅ Target Decision (Bonus Token):
+   -> "," (prob: 0.98)
+------------------------------------------------------------
+Analyze: Draft predicted ' that', but Target wanted ','.
+============================================================
+
+
+
+

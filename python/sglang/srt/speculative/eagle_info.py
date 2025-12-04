@@ -437,39 +437,39 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 print("  spec_info not available")
             
             # Print draft candidates
-            print(f"❌ Draft Candidates (Top-{self.topk} guess):")
-            for k, candidate_id in enumerate(draft_candidates_list[:self.topk]):
-                candidate_text = ""
-                if tokenizer is not None and candidate_id != -1:
-                    try:
-                        candidate_text = tokenizer.decode([candidate_id])
-                    except Exception as e:
-                        candidate_text = f"Token {candidate_id}"
-                else:
-                    candidate_text = f"Token {candidate_id}"
+            # print(f"❌ Draft Candidates (Top-{self.topk} guess):")
+            # for k, candidate_id in enumerate(draft_candidates_list[:self.topk]):
+            #     candidate_text = ""
+            #     if tokenizer is not None and candidate_id != -1:
+            #         try:
+            #             candidate_text = tokenizer.decode([candidate_id])
+            #         except Exception as e:
+            #             candidate_text = f"Token {candidate_id}"
+            #     else:
+            #         candidate_text = f"Token {candidate_id}"
                 
-                # Draft probability is not directly available, use placeholder
-                draft_prob = 0.0
-                print(f"   {k+1}. \"{candidate_text}\" (prob: {draft_prob:.2f})")
+            #     # Draft probability is not directly available, use placeholder
+            #     draft_prob = 0.0
+            #     print(f"   {k+1}. \"{candidate_text}\" (prob: {draft_prob:.2f})")
             
-            print("-" * 60)
+            # print("-" * 60)
             
-            # Print target decision (bonus token)
-            if bonus_token_id is not None:
-                bonus_text = ""
-                if tokenizer is not None:
-                    try:
-                        bonus_text = tokenizer.decode([bonus_token_id])
-                    except Exception as e:
-                        bonus_text = f"Token {bonus_token_id}"
-                else:
-                    bonus_text = f"Token {bonus_token_id}"
+            # # Print target decision (bonus token)
+            # if bonus_token_id is not None:
+            #     bonus_text = ""
+            #     if tokenizer is not None:
+            #         try:
+            #             bonus_text = tokenizer.decode([bonus_token_id])
+            #         except Exception as e:
+            #             bonus_text = f"Token {bonus_token_id}"
+            #     else:
+            #         bonus_text = f"Token {bonus_token_id}"
                 
-                print(f"✅ Target Decision (Bonus Token):")
-                print(f"   -> \"{bonus_text}\" (prob: {bonus_token_prob:.2f})")
-            else:
-                print("✅ Target Decision (Bonus Token):")
-                print("   -> No bonus token")
+            #     print(f"✅ Target Decision (Bonus Token):")
+            #     print(f"   -> \"{bonus_text}\" (prob: {bonus_token_prob:.2f})")
+            # else:
+            #     print("✅ Target Decision (Bonus Token):")
+            #     print("   -> No bonus token")
             
             print("-" * 60)
             

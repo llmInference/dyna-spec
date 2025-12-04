@@ -53,6 +53,23 @@ python3 -m sglang.launch_server \
     --port 30001
 ```
 
+autodl 4090
+```
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-4B \
+  --speculative-algorithm STANDALONE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --max-total-tokens 8192 \
+  --mem-fraction-static 0.5 \
+  --cuda-graph-max-bs 8 \
+  --custom-vocab ./client/vocab_3000.json \
+  --dyna-space 1024 \
+  --enable-return-hidden-states \
+  --port 30001
+  ```
+
 **说明：**
 - `--custom-vocab /path/to/custom_vocab.json`：指定自定义词汇表文件路径（JSON格式）
 - `--dyna-space 1024`：指定在自定义词汇表基础上可以额外添加的 token 数量（默认：1024）

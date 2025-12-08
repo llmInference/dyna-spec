@@ -7,10 +7,14 @@ import threading
 import torch
 import torch.nn.functional as F
 
-# for queries access
+# for queries: begin
+
 import sys
 import os
 import numpy as np
+import bisect
+import requests
+import json
 
 project_root = os.path.join(os.path.dirname(__file__), '../../../..')
 if project_root not in sys.path:
@@ -19,13 +23,12 @@ if project_root not in sys.path:
 from queries.query_hnsw import get_hnsw_similar_words
 from queries.query_graph import get_co_occurrence
 
-lookup = np.load("./generated/lookup.npy") # token_id -> token
+lookup = np.load(project_root + "/queries/generated/lookup.npy") # token_id -> token
 
-import requests
-import json
+with open(project_root + "/queries/assets/custom_static_vocab.txt") as f:
+    static_vocab = [int(line.strip()) for line in f]
 
-
-# end
+# for queries: end
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -394,6 +397,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_index: Optional[torch.Tensor] = None,
         predict: Optional[torch.Tensor] = None,
     ):
+        print("✨ Handle Failure Started")
         """Handle failure analysis for a specific request.
         
         Args:
@@ -405,16 +409,29 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             accept_index: Accepted indices (bs, spec_steps+1)
             predict: Target model predictions (flat tensor)
         """
-        # Get tokenizer if available
-        # tokenizer = getattr(batch.reqs[req_index], 'tokenizer', None)
-        # if tokenizer is None:
-        #     tokenizer = getattr(batch, 'tokenizer', None)
+
+
+        # 0. judge!
+        accepted_id = -1
+        if predict != None:
+            draft_pos = rejection_layer - 1
+            if draft_pos < self.draft_token_num:
+                idx = self.retrive_index[req_index, draft_pos]
+                if idx >= 0 and idx < len(predict):
+                    accepted_id = predict[idx].item()
         
-        # print("\n" + "="*60)
-        # print(f"FAILURE ANALYSIS for Request {req_index} at Layer {rejection_layer}")
-        # print("="*60)
+        # 不知道accepted_id获取对了没
+
+        if accepted_id != -1:
+            idx = bisect.bisect_left(static_vocab, accepted_id)
+            if (idx < len(static_vocab) and static_vocab[idx] == accepted_id):
+                print(f"✨ Accepted token '{lookup[accepted_id]}' is already in static vocab. Skip.")
+                # 如果正确答案已经在精简词汇表里了，说明是小模型自己能力差没猜到，就不加词了
+                return
+
         
         # 1. Get top_k
+        print("✨ Getting top_k & last_hidden_state...")
         top_k = []
         if target_probs is not None and rejection_layer < self.draft_token_num:
             # target_probs shape: (bs, draft_token_num, vocab_size)
@@ -424,21 +441,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             topk = min(self.topk, probs_at_failure.shape[-1])
             top_probs, top_token_ids = torch.topk(probs_at_failure, k=topk)
             
-            print(f"\nTop-{topk} tokens from Target Model at failure layer {rejection_layer}:")
+            # print(f"\nTop-{topk} tokens from Target Model at failure layer {rejection_layer}:")
             for k in range(topk):
                 token_id = top_token_ids[k].item()
                 top_k.append(token_id)
 
+
         # 2. Get last hidden state
         if hasattr(batch, 'spec_info') and hasattr(batch.spec_info, 'hidden_states'):
             hidden_states = batch.spec_info.hidden_states
-            # hidden_states shape: (num_tokens, hidden_size)
-            # where num_tokens = bs * draft_token_num (flattened)
-            # Map (req_index, rejection_layer) to flattened index
+
             if rejection_layer < self.draft_token_num:
                 flat_index = req_index * self.draft_token_num + rejection_layer
                 if flat_index < hidden_states.shape[0]:
-                    last_hidden_state = hidden_states[flat_index].cpu().numpy()
+                    last_hidden_state = hidden_states[flat_index].float().cpu().numpy()
 
                 else:
                     print(f"\nHidden State not available at index {flat_index}")
@@ -446,23 +462,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 print(f"\nHidden State: rejection_layer {rejection_layer} >= draft_token_num {self.draft_token_num}")
         else:
             print(f"\nHidden State not available in batch.spec_info")
-        
-        # # 3. Print draft token that failed
-        # if rejection_layer < candidates.shape[1]:
-        #     draft_token_id = candidates[req_index, rejection_layer].item()
-        #     draft_token_text = ""
-        #     if tokenizer is not None:
-        #         try:
-        #             draft_token_text = tokenizer.decode([draft_token_id])
-        #         except Exception as e:
-        #             draft_token_text = f"Token {draft_token_id}"
-        #     else:
-        #         draft_token_text = f"Token {draft_token_id}"
-        #     print(f"\nDraft Token at failure layer: {draft_token_text}")
-        
-        # print("="*60 + "\n")
 
-        # Query and get C_final
+
+        # 3. Query and get C_final
         hnsw_result = get_hnsw_similar_words(last_hidden_state, 10)
         C_initial = list(set(top_k + hnsw_result))
 
@@ -470,17 +472,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         for token in C_initial:
             C_co_occurrence.extend(get_co_occurrence(token))
         
+        print(f"✨ HNSW Result: {len(hnsw_result)} tokens; C_co_occurrence: {len(C_co_occurrence)} tokens")
+        
         C_final = list(set(C_initial + C_co_occurrence))
 
-        # Add to dyna vocab
+
+        # 4. Add to dyna vocab
         url = "http://127.0.0.1:30000/v1/vocab/add"
         headers = {"Content-Type": "application/json"}
         C_final_words = [lookup[idx] for idx in C_final]
         data = {"words": C_final_words}
-        print("✨ Adding words to dyna vocab: " + C_final_words)
-        
-        response = requests.post(url, headers=headers, json=data)
 
+        print("✨ Adding words to dyna vocab: [" + ", ".join(C_final_words) + "]")
+        
+        # 有一些词可能会被重复添加，不过为了性能考虑，就不做判断了
+        response = requests.post(url, headers=headers, json=data)
+        
 
     def verify(
         self,

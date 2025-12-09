@@ -491,6 +491,12 @@ class EAGLEWorker(TpModelWorker):
         spec_info.num_tokens_for_logprob_per_batch = self.topk
         batch.return_hidden_states = False
 
+        # Save original forward_mode and set to DRAFT_EXTEND for draft model inference
+        # This ensures logits_metadata.forward_mode.is_draft_extend(include_v2=True) returns True
+        original_forward_mode = batch.forward_mode
+        if not batch.forward_mode.is_idle():
+            batch.forward_mode = ForwardMode.DRAFT_EXTEND
+
         # Get forward batch
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
@@ -501,10 +507,15 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
         if can_cuda_graph:
+            logger.info(f"[DRAFT_MODEL] draft, can_cuda_graph: True, forward_mode: {forward_batch.forward_mode} (value: {forward_batch.forward_mode.value if hasattr(forward_batch.forward_mode, 'value') else forward_batch.forward_mode})")
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
+            logger.info(f"[DRAFT_MODEL] draft, parent_list: {parent_list}")
+            logger.info(f"[DRAFT_MODEL] draft, top_scores_index: {top_scores_index}")
+            logger.info(f"[DRAFT_MODEL] draft, draft_tokens: {draft_tokens}")
         else:
+            logger.info(f"[DRAFT_MODEL] draft, can_cuda_graph: False, forward_mode: {forward_batch.forward_mode} (value: {forward_batch.forward_mode.value if hasattr(forward_batch.forward_mode, 'value') else forward_batch.forward_mode})")
             forward_batch.can_run_dp_cuda_graph = False
             if (
                 not forward_batch.forward_mode.is_idle()
@@ -516,6 +527,9 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+
+        # Restore original forward_mode before returning
+        batch.forward_mode = original_forward_mode
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -653,9 +667,14 @@ class EAGLEWorker(TpModelWorker):
         # If dynamic vocab is enabled for the draft model, map draft candidates
         # from local dynamic-vocab indices back to global token IDs before
         # sending them to the target model for verification.
+        # NOTE: draft_token may contain a mix of:
+        # 1. Global token IDs from verified_id (already accepted tokens from previous round)
+        # 2. Local indices from draft_tokens (newly generated draft candidates)
+        # We only need to map the local indices, not the global token IDs.
         if (
             hasattr(model_worker_batch, "dynamic_vocab_token_ids")
             and model_worker_batch.dynamic_vocab_token_ids is not None
+            and self.hot_token_id is None
         ):
             dynamic_ids = model_worker_batch.dynamic_vocab_token_ids
             # Current dynamic vocab implementation for API / client only uses
@@ -668,20 +687,48 @@ class EAGLEWorker(TpModelWorker):
                     f"dynamic_ids[{dynamic_ids.shape}] = {dynamic_ids[:10]}"
                 )
                 dynamic_ids = dynamic_ids.to(device=spec_info.draft_token.device)
-                # spec_info.draft_token is a flat 1D tensor; map element-wise.
-                spec_info.draft_token = dynamic_ids[
-                    spec_info.draft_token.to(dtype=torch.long)
-                ]
-                # If you need debug logs, uncomment the following lines:
-                logger.info(
-                    f"after mapping draft_token[{spec_info.draft_token}] "
-                )
+                vocab_size = dynamic_ids.shape[0]
+                draft_token_long = spec_info.draft_token.to(dtype=torch.long)
+                
+                # Create a mask for indices that are local (need mapping).
+                # Position 0 is the root token and already uses the global ID, so skip it.
+                # Indices >= vocab_size are already global token IDs (from verified_id)
+                position_mask = torch.arange(draft_token_long.numel(), device=draft_token_long.device) > 0
+                local_mask = (draft_token_long < vocab_size) & position_mask
+                
+                if local_mask.any():
+                    # Map only the local indices
+                    mapped_tokens = spec_info.draft_token.clone()
+                    mapped_tokens[local_mask] = dynamic_ids[draft_token_long[local_mask]]
+                    spec_info.draft_token = mapped_tokens
+                    logger.info(
+                        f"after mapping draft_token[{spec_info.draft_token}] "
+                        f"(mapped {local_mask.sum().item()} local indices, "
+                        f"kept {(~local_mask).sum().item()} global token IDs)"
+                    )
+                else:
+                    # No local indices beyond the root token need mapping
+                    logger.info(
+                        f"EAGLEWorker.verify: No local draft_token indices beyond root need mapping "
+                        f"(all tail tokens >= vocab_size={vocab_size}), skipping mapping. "
+                        f"draft_token={spec_info.draft_token}"
+                    )
             else:
                 logger.warning(
                     "EAGLEWorker.verify: Detected per-request dynamic_vocab_token_ids "
                     "(>=2D tensor), which is not yet supported in speculative decoding. "
                     "Draft candidates will be interpreted as global token IDs."
                 )
+        elif (
+            hasattr(model_worker_batch, "dynamic_vocab_token_ids")
+            and model_worker_batch.dynamic_vocab_token_ids is not None
+            and self.hot_token_id is not None
+        ):
+            logger.info(
+                f"EAGLEWorker.verify: Skipping dynamic_vocab_token_ids mapping because "
+                f"hot_token_id is already used. draft_token is already global token IDs: "
+                f"{spec_info.draft_token}"
+            )
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
@@ -691,6 +738,7 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        logger.info(f"[VERIFY] start target worker forward_batch_generation")
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )

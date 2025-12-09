@@ -49,6 +49,7 @@ class EAGLEDraftCudaGraphRunner:
             self.model_runner = model_runner = eagle_worker.model_runner
         self.graphs = {}
         self.output_buffers = {}
+        self.next_token_logits_vocab_size = None  # Will be set during capture
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -135,6 +136,22 @@ class EAGLEDraftCudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        
+        # Print captured vocab_size after capture is complete
+        if self.next_token_logits_vocab_size is not None:
+            logger.info(
+                f"EAGLEDraftCudaGraphRunner: Capture completed. next_token_logits vocab_size = {self.next_token_logits_vocab_size}"
+            )
+            print(
+                f"EAGLEDraftCudaGraphRunner: Capture completed. next_token_logits vocab_size = {self.next_token_logits_vocab_size}"
+            )
+        else:
+            logger.warning(
+                "EAGLEDraftCudaGraphRunner: Capture completed but next_token_logits_vocab_size was not captured"
+            )
+            print(
+                "EAGLEDraftCudaGraphRunner: Capture completed but next_token_logits_vocab_size was not captured"
+            )
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -157,6 +174,30 @@ class EAGLEDraftCudaGraphRunner:
 
         return is_bs_supported
 
+    def get_next_token_logits_vocab_size(self) -> int:
+        """Get the vocabulary size of next_token_logits.
+        
+        Returns:
+            int: The vocabulary size (second dimension) of next_token_logits.
+                 Returns None if not yet captured.
+        """
+        vocab_size = self.next_token_logits_vocab_size
+        if vocab_size is not None:
+            logger.info(
+                f"EAGLEDraftCudaGraphRunner: get_next_token_logits_vocab_size() = {vocab_size}"
+            )
+            print(
+                f"EAGLEDraftCudaGraphRunner: get_next_token_logits_vocab_size() = {vocab_size}"
+            )
+        else:
+            logger.warning(
+                "EAGLEDraftCudaGraphRunner: next_token_logits_vocab_size not yet captured"
+            )
+            print(
+                "EAGLEDraftCudaGraphRunner: next_token_logits_vocab_size not yet captured"
+            )
+        return vocab_size
+
     def capture(self):
         CudaGraphRunner.capture(self)
 
@@ -177,6 +218,10 @@ class EAGLEDraftCudaGraphRunner:
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
         hidden_states = self.hidden_states[:num_seqs]
+
+        logger.info(
+            f"[capture_one_batch_size] EAGLEDraftCudaGraphRunner: Capturing one batch size"
+        )
 
         if self.require_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
@@ -274,6 +319,9 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
+            logger.info(
+                f"[run once] EAGLEDraftCudaGraphRunner: Running once draft forward"
+            )
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
@@ -281,6 +329,63 @@ class EAGLEDraftCudaGraphRunner:
             return ret
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
+
+        # Get next_token_logits vocab size before capture
+        # We'll extract it from the first run_once() call
+        if self.next_token_logits_vocab_size is None:
+            # Temporarily modify run_once to capture vocab_size
+            vocab_size_captured = [None]
+            
+            def run_once_with_vocab_capture():
+                # Clean intermediate result cache for DP attention
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+                set_dp_buffer_len(
+                    global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                )
+                set_is_extend_in_batch(False)
+
+                # Backup two fields, which will be modified in-place in `draft_forward`.
+                output_cache_loc_backup = forward_batch.out_cache_loc
+                hidden_states_backup = forward_batch.spec_info.hidden_states
+
+                # Hook into draft_forward to get logits_output
+                # We need to intercept the forward call inside draft_forward
+                if hasattr(self.eagle_worker, 'draft_model_runner'):
+                    draft_model_runner = self.eagle_worker.draft_model_runner
+                else:
+                    draft_model_runner = self.eagle_worker.draft_runner.model_runner
+                
+                original_forward_method = draft_model_runner.forward
+                
+                def forward_with_capture(*args, **kwargs):
+                    logits_output, hidden = original_forward_method(*args, **kwargs)
+                    if vocab_size_captured[0] is None and logits_output.next_token_logits is not None:
+                        vocab_size_captured[0] = logits_output.next_token_logits.shape[1]
+                    return logits_output, hidden
+                
+                draft_model_runner.forward = forward_with_capture
+                
+                try:
+                    ret = self.eagle_worker.draft_forward(forward_batch)
+                finally:
+                    draft_model_runner.forward = original_forward_method
+
+                forward_batch.out_cache_loc = output_cache_loc_backup
+                forward_batch.spec_info.hidden_states = hidden_states_backup
+                return ret
+            
+            # Run once to capture vocab_size
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+            run_once_with_vocab_capture()
+            
+            if vocab_size_captured[0] is not None:
+                self.next_token_logits_vocab_size = vocab_size_captured[0]
+                logger.info(
+                    f"EAGLEDraftCudaGraphRunner: Captured next_token_logits vocab_size = {self.next_token_logits_vocab_size}"
+                )
 
         for _ in range(2):
             torch.cuda.synchronize()
@@ -307,6 +412,16 @@ class EAGLEDraftCudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        
+        # Print next_token_logits vocab_size for each request
+        if self.next_token_logits_vocab_size is not None:
+            logger.info(
+                f"EAGLEDraftCudaGraphRunner.replay: Request received. batch_size={raw_bs}, next_token_logits vocab_size={self.next_token_logits_vocab_size}"
+            )
+        else:
+            logger.warning(
+                f"EAGLEDraftCudaGraphRunner.replay: Request received. batch_size={raw_bs}, but next_token_logits_vocab_size not yet captured"
+            )
 
         # Pad
         if self.require_mlp_tp_gather:

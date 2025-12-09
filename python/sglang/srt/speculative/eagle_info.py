@@ -222,6 +222,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # Get previous outputs (before this verification round)
             if prev_output_ids_list is not None and i < len(prev_output_ids_list):
                 prev_output_ids = prev_output_ids_list[i]
+                logger.info(f"prev_output_ids[{i}]={prev_output_ids}")
             else:
                 # Fallback: try to get from req.output_ids
                 num_new_tokens = accept_length_cpu[i] + 1  # +1 for bonus token
@@ -282,8 +283,158 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             else:
                 print(f"Draft Accepted All {self.draft_token_num} Tokens.")
             
-            print(f"\nContext: \"{context_text}\"")
+            # Print input_ids sequence and corresponding tokens
+            print(f"\nInput IDs Sequence and Tokens:")
             print("-" * 60)
+            if tokenizer is not None and len(prev_output_ids) > 0:
+                for idx, token_id in enumerate(prev_output_ids):
+                    try:
+                        # Decode single token
+                        token_text = tokenizer.decode([token_id])
+                        # Escape special characters for better display
+                        token_text_repr = repr(token_text)
+                        print(f"  [{idx:4d}] ID: {token_id:6d} -> Token: {token_text_repr}")
+                    except Exception as e:
+                        print(f"  [{idx:4d}] ID: {token_id:6d} -> Token: <decode_error: {e}>")
+            else:
+                # Fallback: just show token IDs if no tokenizer
+                for idx, token_id in enumerate(prev_output_ids):
+                    print(f"  [{idx:4d}] ID: {token_id:6d}")
+            print("-" * 60)
+
+            # Print verification details by position
+            print("\nVerification Details by Position:")
+            print("-" * 60)
+            
+            if hasattr(batch, 'spec_info') and batch.spec_info is not None:
+                spec_info = batch.spec_info
+                # draft_token shape is (bs * draft_token_num,), need to reshape for this request
+                draft_token_reshaped = spec_info.draft_token.reshape(bs, self.draft_token_num)
+                draft_tokens_for_req = draft_token_reshaped[i].cpu().tolist()
+                
+                # Get tree structure information for this request
+                retrive_index_req = spec_info.retrive_index[i].cpu().tolist() if spec_info.retrive_index is not None else None
+                retrive_next_token_req = spec_info.retrive_next_token[i].cpu().tolist() if spec_info.retrive_next_token is not None else None
+                retrive_next_sibling_req = spec_info.retrive_next_sibling[i].cpu().tolist() if spec_info.retrive_next_sibling is not None else None
+                positions_req = spec_info.positions[i * self.draft_token_num:(i + 1) * self.draft_token_num].cpu().tolist() if spec_info.positions is not None else None
+                
+                # Get draft token probabilities if available (from topk_p and topk_index)
+                draft_probs_available = False
+                draft_token_probs = {}
+                if hasattr(spec_info, 'topk_p') and spec_info.topk_p is not None and hasattr(spec_info, 'topk_index') and spec_info.topk_index is not None:
+                    try:
+                        # topk_p shape: (bs * draft_token_num, topk) or similar
+                        # topk_index shape: (bs * draft_token_num, topk)
+                        topk_p_req = spec_info.topk_p[i * self.draft_token_num:(i + 1) * self.draft_token_num].cpu()
+                        topk_index_req = spec_info.topk_index[i * self.draft_token_num:(i + 1) * self.draft_token_num].cpu()
+                        if topk_p_req.shape[0] == self.draft_token_num:
+                            draft_probs_available = True
+                            for tree_idx in range(self.draft_token_num):
+                                if tree_idx < topk_p_req.shape[0]:
+                                    probs = topk_p_req[tree_idx].tolist()
+                                    indices = topk_index_req[tree_idx].tolist()
+                                    draft_token_probs[tree_idx] = dict(zip(indices, probs))
+                    except Exception:
+                        draft_probs_available = False
+                
+                # Group tokens by position (using positions_req to map tree_idx to actual position)
+                position_to_tree_indices = {}
+                for tree_idx in range(self.draft_token_num):
+                    if positions_req is not None and tree_idx < len(positions_req):
+                        pos = positions_req[tree_idx]
+                    else:
+                        # Fallback: assume sequential positions starting from 0
+                        pos = tree_idx
+                    
+                    if pos not in position_to_tree_indices:
+                        position_to_tree_indices[pos] = []
+                    position_to_tree_indices[pos].append(tree_idx)
+                
+                # Process each position
+                # Root (tree_idx 0) is already verified in the previous round and will
+                # not be part of the current verification steps. Current verification
+                # starts from tree_idx 1, so verification step k maps to tree_idx k+1.
+                verification_offset = 1
+                for pos in sorted(position_to_tree_indices.keys()):
+                    tree_indices_at_pos = position_to_tree_indices[pos]
+                    print(f"\nPosition {pos}:")
+                    
+                    # Print all draft candidates at this position
+                    print("  Draft Model Candidates:")
+                    for tree_idx in tree_indices_at_pos:
+                        if tree_idx < len(draft_tokens_for_req):
+                            draft_token_id = draft_tokens_for_req[tree_idx]
+                            draft_token_text = ""
+                            if tokenizer is not None:
+                                try:
+                                    draft_token_text = tokenizer.decode([draft_token_id])
+                                except Exception:
+                                    draft_token_text = f"Token {draft_token_id}"
+                            else:
+                                draft_token_text = f"Token {draft_token_id}"
+                            
+                            # Get probability if available
+                            prob_str = ""
+                            if draft_probs_available and tree_idx in draft_token_probs:
+                                if draft_token_id in draft_token_probs[tree_idx]:
+                                    prob = draft_token_probs[tree_idx][draft_token_id]
+                                    prob_str = f" (prob={prob:.4f})"
+                                else:
+                                    prob_str = " (prob=N/A)"
+                            else:
+                                prob_str = " (prob=N/A)"
+                            
+                            print(f"    - token_id={draft_token_id}, text=\"{draft_token_text}\"{prob_str}")
+                    
+                    # Get target model's prediction at this position
+                    # Use the first tree_idx at this position to determine verification step.
+                    # Root (tree_idx 0) is already verified; verification step 0 corresponds to tree_idx 1.
+                    verify_step = None
+                    if tree_indices_at_pos:
+                        primary_tree_idx = tree_indices_at_pos[0]
+                        if primary_tree_idx >= verification_offset:
+                            verify_step = primary_tree_idx - verification_offset
+                    
+                    # Check if this position was accepted
+                    is_accepted = False
+                    accepted_token_id = None
+                    if verify_step is not None and verify_step < len(accept_row):
+                        accept_idx = accept_row[verify_step]
+                        logger.info(f"[VERIFY] verify_step: {verify_step}, accept_idx: {accept_idx}")
+                        if accept_idx != -1 and 0 <= accept_idx < len(predict_cpu):
+                            is_accepted = True
+                            accepted_token_id = predict_cpu[accept_idx]
+                    
+                    # Get target model's prediction and probability
+                    target_token_id = None
+                    target_token_prob = None
+                    if target_probs_cpu is not None and verify_step is not None and verify_step < self.draft_token_num:
+                        target_probs_at_pos = target_probs_cpu[i, verify_step]
+                        target_token_id = torch.argmax(target_probs_at_pos).item()
+                        target_token_prob = target_probs_at_pos[target_token_id].item()
+                        logger.info(f"[VERIFY] target_token_id: {target_token_id}, target_token_prob: {target_token_prob}")
+                    # Print target model result
+                    print("  Target Model Result:")
+                    if target_token_id is not None:
+                        target_token_text = ""
+                        if tokenizer is not None:
+                            try:
+                                target_token_text = tokenizer.decode([target_token_id])
+                            except Exception:
+                                target_token_text = f"Token {target_token_id}"
+                        else:
+                            target_token_text = f"Token {target_token_id}"
+                        
+                        prob_str = f" (prob={target_token_prob:.4f})" if target_token_prob is not None else " (prob=N/A)"
+                        
+                        if is_accepted:
+                            print(f"    ✓ ACCEPTED: token_id={target_token_id}, text=\"{target_token_text}\"{prob_str}")
+                        else:
+                            print(f"    ✗ REJECTED: token_id={target_token_id}, text=\"{target_token_text}\"{prob_str}")
+                    else:
+                        print("    (target model prediction not available)")
+            else:
+                print("  spec_info not available")
             
             # Print draft candidates
             print(f"❌ Draft Candidates (Top-{self.topk} guess):")
@@ -322,28 +473,31 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             
             print("-" * 60)
             
-            # Print analysis
-            if rejection_layer < self.draft_token_num and len(draft_candidates_list) > 0:
-                draft_pred = draft_candidates_list[0] if len(draft_candidates_list) > 0 else -1
-                draft_pred_text = ""
-                if tokenizer is not None and draft_pred != -1:
-                    try:
-                        draft_pred_text = tokenizer.decode([draft_pred])
-                    except Exception as e:
-                        draft_pred_text = f"Token {draft_pred}"
-                else:
-                    draft_pred_text = f"Token {draft_pred}"
-                
-                target_wanted_text = ""
-                if bonus_token_id is not None and tokenizer is not None:
-                    try:
-                        target_wanted_text = tokenizer.decode([bonus_token_id])
-                    except Exception as e:
-                        target_wanted_text = f"Token {bonus_token_id}"
-                else:
-                    target_wanted_text = f"Token {bonus_token_id}" if bonus_token_id is not None else "None"
-                
-                print(f"Analyze: Draft predicted '{draft_pred_text}', but Target wanted '{target_wanted_text}'.")
+            # Print accepted tokens by target model in this round
+            print("\n本轮次目标模型接受的Token:")
+            print("-" * 60)
+            accepted_tokens_this_round = []
+            for verify_step in range(len(accept_row)):
+                if accept_row[verify_step] != -1:
+                    accepted_idx = accept_row[verify_step]
+                    if 0 <= accepted_idx < len(predict_cpu):
+                        accepted_token_id = predict_cpu[accepted_idx]
+                        accepted_tokens_this_round.append((verify_step, accepted_token_id))
+            
+            if len(accepted_tokens_this_round) > 0:
+                for verify_step, accepted_token_id in accepted_tokens_this_round:
+                    accepted_token_text = ""
+                    if tokenizer is not None:
+                        try:
+                            accepted_token_text = tokenizer.decode([accepted_token_id])
+                        except Exception as e:
+                            accepted_token_text = f"Token {accepted_token_id}"
+                    else:
+                        accepted_token_text = f"Token {accepted_token_id}"
+                    
+                    print(f"  验证步骤 {verify_step}: token_id={accepted_token_id}, text=\"{accepted_token_text}\"")
+            else:
+                print("  本轮次没有接受的token")
             
             print("="*60 + "\n")
 
@@ -470,7 +624,31 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
-        target_probs_for_log = None
+        # Compute temperature/top-k/top-p aware probabilities for logging and display
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, self.draft_token_num, dim=0
+        )  # (bs * draft_token_num, 1)
+        logger.info(f"[VERIFY] expanded_temperature: {expanded_temperature}")
+        target_probs_for_log = F.softmax(
+            logits_output.next_token_logits / expanded_temperature, dim=-1
+        )  # (bs * draft_token_num, vocab_size)
+        target_probs_for_log = top_k_renorm_prob(
+            target_probs_for_log,
+            torch.repeat_interleave(
+                sampling_info.top_ks, self.draft_token_num, dim=0
+            ),
+        )  # (bs * draft_token_num, vocab_size)
+        if not torch.all(sampling_info.top_ps == 1.0):
+            target_probs_for_log = top_p_renorm_prob(
+                target_probs_for_log,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, self.draft_token_num, dim=0
+                ),
+            )
+        target_probs_for_log = target_probs_for_log.reshape(
+            bs, self.draft_token_num, -1
+        )
+
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
@@ -485,34 +663,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
-            # Compute probabilities for logging in greedy case
-            target_logits_reshaped = logits_output.next_token_logits.reshape(bs, self.draft_token_num, -1)
-            target_probs_for_log = F.softmax(target_logits_reshaped, dim=-1)
-
+            logger.info(f"[VERIFY] target_predict: {target_predict}")
         else:
-            # apply temperature and get target probs
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
-            )  # (bs * draft_token_num, 1)
-
-            target_probs = F.softmax(
-                logits_output.next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )  # (bs * draft_token_num, vocab_size)
-            if not torch.all(sampling_info.top_ps == 1.0):
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, self.draft_token_num, dim=0
-                    ),
-                )
-            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-            target_probs_for_log = target_probs
+            # Use temperature-aware probabilities directly for sampling
+            target_probs = target_probs_for_log
 
             draft_probs = torch.zeros(
                 target_probs.shape, dtype=torch.float32, device=batch.device
@@ -558,9 +712,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
+        logger.info(f"[VERIFY] accept_index: {accept_index}")
+        logger.info(f"[VERIFY] predict: {predict}")
 
         # Save output_ids before modification for logging
         prev_output_ids_list = [list(req.output_ids) for req in batch.reqs]
+        logger.info(f"[VERIFY] prev_output_ids_list: {prev_output_ids_list}")
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -632,6 +789,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
         verified_id = predict[accept_index]
+        logger.info(f"accept_index: {accept_index}")
+        logger.info(f"verified_id: {verified_id}")
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         accept_length_cpu = accept_length.cpu()

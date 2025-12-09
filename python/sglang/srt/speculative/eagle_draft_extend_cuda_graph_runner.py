@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import bisect
+import logging
 from typing import TYPE_CHECKING, Callable
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -190,6 +193,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         CudaGraphRunner.capture(self)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
+        logger.info(f"[DRAFT_CAPTURE] capture_one_batch_size, bs: {bs}")
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -292,6 +296,7 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         # Run and capture
         def run_once():
+            logger.info(f"[DRAFT_MODEL] run_once")
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
@@ -305,11 +310,18 @@ class EAGLEDraftExtendCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
+            logger.info(f"[DRAFT_MODEL] Starting draft model forward, forward_mode: {forward_batch.forward_mode} (value: {forward_batch.forward_mode.value if hasattr(forward_batch.forward_mode, 'value') else forward_batch.forward_mode})")
+            logger.info(f"[DRAFT_MODEL] forward_batch.dynamic_vocab_token_ids is not None: {forward_batch.dynamic_vocab_token_ids is not None}")
+            if forward_batch.dynamic_vocab_token_ids is not None:
+                logger.info(f"[DRAFT_MODEL] forward_batch.dynamic_vocab_token_ids.shape: {forward_batch.dynamic_vocab_token_ids.shape}")
+            
             ret = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
             )
+            
+            logger.info(f"[DRAFT_MODEL] Draft model forward completed")
             probs = torch.softmax(ret.next_token_logits, dim=-1)
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
@@ -335,6 +347,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
 
+        logger.info(f"[DRAFT_REPLAY] forward_mode at replay input: {forward_batch.forward_mode} (value: {forward_batch.forward_mode.value})")
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size

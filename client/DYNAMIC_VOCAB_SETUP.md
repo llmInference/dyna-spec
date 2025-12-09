@@ -42,7 +42,7 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-4B \
     --speculative-algorithm STANDALONE \
-    --speculative-draft-model-path Qwen/Qwen3-1.7B \
+    --speculative-draft-model-path ../Qwen3-1.7B \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \

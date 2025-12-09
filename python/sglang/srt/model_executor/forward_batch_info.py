@@ -216,6 +216,11 @@ class ForwardBatch:
     top_p_normalized_logprobs: bool = False
     top_p: torch.Tensor = None
 
+    # Dynamic vocab (subset projection) support.
+    # This stores the active vocab ids after batching, to be consumed by logits processor.
+    # It can be a flattened tensor or other batched representation decided by the caller.
+    dynamic_vocab_token_ids: Optional[torch.Tensor] = None
+
     # Position information
     positions: torch.Tensor = None
 
@@ -380,6 +385,12 @@ class ForwardBatch:
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            )
+
+        # Extract dynamic_vocab_token_ids from ModelWorkerBatch
+        if batch.dynamic_vocab_token_ids is not None:
+            ret.dynamic_vocab_token_ids = batch.dynamic_vocab_token_ids.to(
+                device, non_blocking=True
             )
 
         if enable_num_token_non_padded(model_runner.server_args):

@@ -35,6 +35,9 @@ class SglSamplingParams:
     return_text_in_logprobs: Optional[bool] = (None,)
     json_schema: Optional[str] = None
 
+    # Dynamic vocab (subset projection) support. This is passed through only to SRT.
+    dynamic_vocab_token_ids: Optional[List[int]] = None
+
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
     regex: Optional[str] = None
@@ -59,6 +62,7 @@ class SglSamplingParams:
             self.top_logprobs_num,
             self.return_text_in_logprobs,
             self.json_schema,
+            self.dynamic_vocab_token_ids,
         )
 
     def to_openai_kwargs(self):
@@ -135,6 +139,7 @@ class SglSamplingParams:
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
             "json_schema": self.json_schema,
+            "dynamic_vocab_token_ids": self.dynamic_vocab_token_ids,
         }
 
 
@@ -172,6 +177,7 @@ class SglFunction:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         ignore_eos: bool = False,
+        dynamic_vocab_token_ids: Optional[List[int]] = None,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
@@ -208,6 +214,7 @@ class SglFunction:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             return_text_in_logprobs=return_text_in_logprobs,
+            dynamic_vocab_token_ids=dynamic_vocab_token_ids,
         )
         backend = backend or global_config.default_backend
         return run_program(
@@ -236,6 +243,7 @@ class SglFunction:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         ignore_eos: bool = False,
+        dynamic_vocab_token_ids: Optional[List[int]] = None,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
@@ -289,6 +297,7 @@ class SglFunction:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             return_text_in_logprobs=return_text_in_logprobs,
+            dynamic_vocab_token_ids=dynamic_vocab_token_ids,
         )
         backend = backend or global_config.default_backend
         return run_program_batch(
@@ -477,6 +486,7 @@ class SglGen(SglExpr):
         dtype: Optional[type] = None,
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
+        dynamic_vocab_token_ids: Optional[List[int]] = None,
     ):
         """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
         super().__init__()
@@ -502,6 +512,7 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
             json_schema=json_schema,
+            dynamic_vocab_token_ids=dynamic_vocab_token_ids,
         )
 
     def __repr__(self):

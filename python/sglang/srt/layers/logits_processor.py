@@ -71,6 +71,8 @@ class LogitsProcessorOutput:
     next_token_logits: Optional[torch.Tensor]
     # Mapping from static vocabulary indices back to the original token ids, if static vocab is active.
     static_vocab_token_ids: Optional[torch.Tensor] = None
+    # Mapping from dynamic vocabulary indices back to the original token ids, if dynamic vocab is active.
+    dynamic_vocab_token_ids: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -107,6 +109,9 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+
+    # Dynamic vocab (subset projection) support. Mirrors ForwardBatch.dynamic_vocab_token_ids.
+    dynamic_vocab_token_ids: Optional[torch.Tensor] = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -174,6 +179,7 @@ class LogitsMetadata:
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            dynamic_vocab_token_ids=forward_batch.dynamic_vocab_token_ids,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -426,6 +432,8 @@ class LogitsProcessor(nn.Module):
 
         return LogitsProcessorOutput(
             next_token_logits=None,  # Multi-item scoring doesn't need next token logits
+            static_vocab_token_ids=self._active_static_indices,
+            dynamic_vocab_token_ids=logits_metadata.dynamic_vocab_token_ids,
             input_token_logprobs=input_token_logprobs,
             input_top_logprobs_val=input_top_logprobs_val,
             input_top_logprobs_idx=input_top_logprobs_idx,
@@ -656,6 +664,7 @@ class LogitsProcessor(nn.Module):
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             static_vocab_token_ids=self._active_static_indices,
+            dynamic_vocab_token_ids=logits_metadata.dynamic_vocab_token_ids,
             hidden_states=hidden_states_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
@@ -882,7 +891,9 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
-        logits = self._project_hidden_to_vocab(hidden_states, lm_head, embedding_bias)
+        logits = self._project_hidden_to_vocab(
+            hidden_states, lm_head, logits_metadata, embedding_bias
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -929,19 +940,34 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
 
-        if self.use_static_vocab and self.static_vocab_size:
-            static_indices = self._get_static_indices_for_device(logits.device)
-            logits = torch.index_select(logits, dim=1, index=static_indices).float()
-            self._active_static_indices = static_indices
-        else:
-            self._active_static_indices = None
-            if logits_metadata.next_token_logits_buffer is not None:
-                logits_buffer = logits_metadata.next_token_logits_buffer
-                assert logits_buffer.dtype == torch.float
-                logits_buffer.copy_(logits[:, : self.config.vocab_size])
-                logits = logits_buffer
+        # Dynamic vocab should only be used for draft models.
+        # For target models, always use full vocabulary.
+        is_draft_model = logits_metadata.forward_mode.is_draft_extend(include_v2=True)
+        dynamic_vocab_active = (
+            logits_metadata.dynamic_vocab_token_ids is not None and is_draft_model
+        )
+        
+        # If dynamic vocab is enabled for draft models, we should not apply static vocab projection or
+        # truncate to full vocab. The caller is responsible for interpreting the
+        # returned logits according to `dynamic_vocab_token_ids`.
+        if not dynamic_vocab_active:
+            if self.use_static_vocab and self.static_vocab_size:
+                static_indices = self._get_static_indices_for_device(logits.device)
+                logits = torch.index_select(logits, dim=1, index=static_indices).float()
+                self._active_static_indices = static_indices
             else:
-                logits = logits[:, : self.config.vocab_size].float()
+                self._active_static_indices = None
+                if logits_metadata.next_token_logits_buffer is not None:
+                    logits_buffer = logits_metadata.next_token_logits_buffer
+                    assert logits_buffer.dtype == torch.float
+                    logits_buffer.copy_(logits[:, : self.config.vocab_size])
+                    logits = logits_buffer
+                else:
+                    logits = logits[:, : self.config.vocab_size].float()
+        else:
+            # Dynamic vocab active for draft model: ensure static vocab is marked inactive so that
+            # downstream components do not attempt to use it.
+            self._active_static_indices = None
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -1018,11 +1044,48 @@ class LogitsProcessor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # Dynamic vocab (subset projection) should only be used for draft models.
+        # Target models should use the full vocabulary to ensure output quality.
+        dynamic_ids = logits_metadata.dynamic_vocab_token_ids
+        is_draft_model = (
+            logits_metadata.forward_mode.is_draft_extend(include_v2=True)
+        )
+        
+        # Only apply dynamic vocab for draft models, not for target models
+        if dynamic_ids is not None and hasattr(lm_head, "weight") and is_draft_model:
+            # Normalize ids to a LongTensor on the lm_head weight device.
+            if not isinstance(dynamic_ids, torch.Tensor):
+                dynamic_ids = torch.as_tensor(dynamic_ids, dtype=torch.long)
+            else:
+                dynamic_ids = dynamic_ids.to(dtype=torch.long)
+            dynamic_ids = dynamic_ids.to(lm_head.weight.device)
+
+            proj_dtype = torch.float32 if self.use_fp32_lm_head else lm_head.weight.dtype
+            hidden_proj = hidden_states.to(proj_dtype)
+            weight = lm_head.weight.to(proj_dtype)
+            
+            # dynamic_vocab_token_ids is always 1D (global shared vocab)
+            # Gather a subset of vocab rows and do a smaller matmul: [B, H] x [H, V_sub]
+            if dynamic_ids.dim() != 1:
+                raise ValueError(
+                    f"dynamic_vocab_token_ids must be 1D tensor, got {dynamic_ids.dim()}D"
+                )
+            weight_slice = torch.index_select(weight, 0, dynamic_ids)
+            logits = torch.matmul(hidden_proj, weight_slice.T)
+            
+            return logits.to(hidden_states.dtype)
+        
+        # For target models or when dynamic vocab is not provided, use full vocabulary
+        # This ensures target models always use the complete vocabulary for quality
+
+        # Static vocab path (only when dynamic vocab is not active).
         if self.use_static_vocab and isinstance(lm_head, VocabParallelEmbedding):
             return self._matmul_static_vocab_parallel(hidden_states, lm_head)
 
+        # Default full-vocab projection.
         if hasattr(lm_head, "weight"):
             if self.use_fp32_lm_head:
                 return torch.matmul(

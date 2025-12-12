@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.dynamic_vocab_ops import dynamic_vocab_matmul
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -276,6 +277,45 @@ class LogitsProcessor(nn.Module):
 
         if not self.use_static_vocab:
             self.static_vocab_size = None
+
+        # Dynamic Vocab Init
+        self.dynamic_vocab_capacity = getattr(config, "dynamic_vocab_capacity", None)
+        logger.info(
+            f"LogitsProcessor init: config_type={type(config).__name__}, "
+            f"has_dynamic_vocab_capacity={hasattr(config, 'dynamic_vocab_capacity')}, "
+            f"dynamic_vocab_capacity={self.dynamic_vocab_capacity}"
+        )
+        self.dynamic_vocab_manager = None
+        self.dynamic_weights = None
+        self._dynamic_weights_populated = 0
+
+        if self.dynamic_vocab_capacity is not None and self.dynamic_vocab_capacity > 0:
+            from sglang.srt.managers.dynamic_vocab_manager import (
+                DynamicVocabularyManager,
+            )
+
+            self.dynamic_vocab_manager = DynamicVocabularyManager(
+                capacity=self.dynamic_vocab_capacity,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            # Initialize dynamic weights buffer [Capacity, Hidden]
+            # We don't know hidden size yet?
+            # Usually config.hidden_size is available.
+            hidden_size = getattr(config, "hidden_size", None)
+            if hidden_size:
+                dtype = getattr(config, "torch_dtype", None) or torch.float16
+                if isinstance(dtype, str):
+                    dtype = getattr(torch, dtype, torch.float16)
+
+                self.dynamic_weights = torch.zeros(
+                    (self.dynamic_vocab_capacity, hidden_size),
+                    dtype=dtype,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                )
+                logger.info(
+                    f"LogitsProcessor: DynamicVocabManager created with capacity={self.dynamic_vocab_capacity}, "
+                    f"dynamic_weights shape={self.dynamic_weights.shape}, device={self.dynamic_weights.device}"
+                )
 
         self.register_buffer(
             "_static_vocab_indices", static_indices_tensor, persistent=False
@@ -861,6 +901,34 @@ class LogitsProcessor(nn.Module):
             sampled_logits,
         )
 
+    def _update_dynamic_weights(self, lm_head):
+        if self.dynamic_vocab_manager is None:
+            return
+
+        current_populated = self.dynamic_vocab_manager.populated_size
+        if current_populated <= self._dynamic_weights_populated:
+            return
+
+        # Update weights for new slots
+        new_slots_start = self._dynamic_weights_populated
+        new_slots_end = current_populated
+
+        slots = self.dynamic_vocab_manager.slots
+        token_ids = slots[new_slots_start:new_slots_end]
+
+        # Fetch weights
+        # TODO: Handle VocabParallelEmbedding (TP) correctly by gathering weights from owner ranks.
+        # For now, assuming non-TP or weights are accessible.
+        if hasattr(lm_head, "weight"):
+            weights = lm_head.weight[token_ids]
+            # Ensure weights are on same device/dtype
+            weights = weights.to(
+                dtype=self.dynamic_weights.dtype, device=self.dynamic_weights.device
+            )
+            self.dynamic_weights[new_slots_start:new_slots_end] = weights
+
+        self._dynamic_weights_populated = current_populated
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -933,6 +1001,60 @@ class LogitsProcessor(nn.Module):
             static_indices = self._get_static_indices_for_device(logits.device)
             logits = torch.index_select(logits, dim=1, index=static_indices).float()
             self._active_static_indices = static_indices
+
+            # Dynamic Vocab Integration
+            if self.dynamic_vocab_manager:
+                self._update_dynamic_weights(lm_head)
+
+                # CRITICAL: Always execute dynamic vocab path (even if populated_size=0)
+                # to ensure CUDA graph captures this branch.
+                # When populated_size=0, Triton kernel returns all -inf, which is safe.
+                # Use GPU tensor for populated_size to avoid scalar baking into CUDA graph
+                populated_size = (
+                    self.dynamic_vocab_manager.populated_size
+                )  # For debug printing
+                populated_size_tensor = (
+                    self.dynamic_vocab_manager.populated_size_gpu
+                )  # For kernel
+
+                # Compute dynamic logits for ALL capacity slots (Triton kernel handles masking)
+                hidden_for_dynamic = hidden_states.to(self.dynamic_weights.dtype)
+
+                # Triton kernel returns [M, Capacity] with -inf for unpopulated slots
+                dynamic_logits = dynamic_vocab_matmul(
+                    hidden_for_dynamic,
+                    self.dynamic_weights,
+                    populated_size_tensor,  # Pass GPU tensor pointer
+                )
+
+                # Cast to float32 to match logits
+                dynamic_logits = dynamic_logits.to(logits.dtype)
+
+                # Debug: Log logits statistics
+                if (
+                    populated_size > 0 and torch.rand(1).item() < 0.01
+                ):  # Log 1% of the time
+                    logger.info(
+                        f"Dynamic vocab: populated_size={populated_size}, "
+                        f"capacity={self.dynamic_vocab_capacity}, "
+                        f"static_logits_shape={logits.shape}, "
+                        f"dynamic_logits_shape={dynamic_logits.shape}, "
+                        f"static_max={logits.max().item():.2f}, "
+                        f"dynamic_max={dynamic_logits[:, :populated_size].max().item():.2f}"
+                    )
+
+                # CRITICAL: Concatenate FULL capacity (not sliced) to maintain CUDA Graph compatibility
+                # Triton kernel already set unpopulated slots to -inf, so they won't be sampled
+                logits = torch.cat([logits, dynamic_logits], dim=1)
+
+                # Update active indices - use FULL capacity slots
+                # The slots tensor has -1 for unpopulated entries, which is fine
+                # Sampling will never pick these because their logits are -inf
+                dynamic_slots = self.dynamic_vocab_manager.slots.to(
+                    static_indices.device
+                )
+                self._active_static_indices = torch.cat([static_indices, dynamic_slots])
+
         else:
             self._active_static_indices = None
             if logits_metadata.next_token_logits_buffer is not None:

@@ -78,6 +78,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     DestroyWeightsUpdateGroupReqInput,
+    DynamicVocabAddReqInput,
+    DynamicVocabStatusReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -1637,3 +1639,37 @@ def _wait_weights_ready():
         f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
         f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
     )
+
+
+@app.post("/dynamic_vocab/add")
+async def dynamic_vocab_add(obj: DynamicVocabAddReqInput):
+    if _global_state.tokenizer_manager is None:
+        return {"error": "Tokenizer manager is not initialized"}
+
+    if obj.new_token_ids_path is not None:
+        try:
+            with open(obj.new_token_ids_path, "r") as f:
+                content = f.read().strip()
+                # Support comma separated or newline separated
+                if "," in content:
+                    ids = [int(x.strip()) for x in content.split(",") if x.strip()]
+                else:
+                    ids = [int(x.strip()) for x in content.split() if x.strip()]
+                obj.new_token_ids = ids
+        except Exception as e:
+            return {"error": f"Failed to read token ids from file: {str(e)}"}
+
+    if obj.new_token_ids is None:
+        return {"error": "Either new_token_ids or new_token_ids_path must be provided"}
+
+    slots = await _global_state.tokenizer_manager.dynamic_vocab_add(obj)
+    return {"status": "success", "slots": slots}
+
+
+@app.post("/dynamic_vocab/status")
+async def dynamic_vocab_status(obj: DynamicVocabStatusReqInput):
+    if _global_state.tokenizer_manager is None:
+        return {"error": "Tokenizer manager is not initialized"}
+
+    result = await _global_state.tokenizer_manager.dynamic_vocab_status(obj)
+    return result

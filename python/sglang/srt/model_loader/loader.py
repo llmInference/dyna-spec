@@ -249,6 +249,14 @@ def _initialize_model(
     )
 
     # Build kwargs conditionally
+    # Inject dynamic_vocab_capacity into hf_config if present in model_config
+    if hasattr(model_config, "dynamic_vocab_capacity"):
+        setattr(
+            model_config.hf_config,
+            "dynamic_vocab_capacity",
+            model_config.dynamic_vocab_capacity,
+        )
+
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,

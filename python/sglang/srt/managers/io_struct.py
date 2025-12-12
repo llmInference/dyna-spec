@@ -648,7 +648,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: int
     # If return logprobs, the token id to return logprob for
-    token_ids_logprob: List[int]
+    token_ids_logprobs: List[int]
     # Whether to stream output
     stream: bool
 
@@ -1550,6 +1550,29 @@ class LazyDumpTensorsReqInput(BaseReq):
 @dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class DynamicVocabAddReqInput(BaseReq):
+    vocab_size: int
+    new_token_ids: Optional[List[int]] = None
+    new_weights: Optional[List[List[float]]] = None
+    new_token_ids_path: Optional[str] = None
+
+
+@dataclass
+class DynamicVocabAddReqOutput(BaseReq):
+    slots: List[int]
+
+
+@dataclass
+class DynamicVocabStatusReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class DynamicVocabStatusReqOutput(BaseReq):
+    status: Dict
 
 
 def _check_all_req_types():

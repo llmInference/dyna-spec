@@ -74,6 +74,10 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DynamicVocabAddReqInput,
+    DynamicVocabAddReqOutput,
+    DynamicVocabStatusReqInput,
+    DynamicVocabStatusReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -570,6 +574,8 @@ class Scheduler(
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
+                (DynamicVocabAddReqInput, self.dynamic_vocab_add),
+                (DynamicVocabStatusReqInput, self.dynamic_vocab_status),
             ]
         )
 
@@ -1244,7 +1250,7 @@ class Scheduler(
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
-                token_ids_logprob=recv_req.token_ids_logprob,
+                token_ids_logprob=recv_req.token_ids_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
@@ -1971,7 +1977,7 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            return self._run_batch
 
         # Run forward
         if self.is_generation:
@@ -2572,6 +2578,58 @@ class Scheduler(
         freeze_gc("Scheduler")
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
+
+    def dynamic_vocab_add(self, obj: DynamicVocabAddReqInput):
+        if self.draft_worker and hasattr(self.draft_worker, "draft_model_runner"):
+            slots = self.draft_worker.draft_model_runner.dynamic_vocab_add(obj)
+
+            # Update the inverse map to include newly added dynamic vocab tokens
+            if slots and hasattr(self.draft_worker, "_static_vocab_inverse_map"):
+                if self.draft_worker._static_vocab_inverse_map is None:
+                    self.draft_worker._static_vocab_inverse_map = {}
+
+                # Get the static vocab size (number of static tokens)
+                draft_config = self.draft_worker.draft_model_runner.model_config
+                static_vocab_size = getattr(draft_config, "static_vocab_size", 0)
+
+                # Get the manager to fetch token IDs for these slots
+                lp = self.draft_worker.draft_model_runner.model.logits_processor
+                if lp and lp.dynamic_vocab_manager:
+                    # Update inverse map for ALL capacity slots (not just newly added)
+                    # This ensures the mapping is complete for the full capacity
+                    for slot_idx in range(lp.dynamic_vocab_manager.capacity):
+                        token_id_tensor = lp.dynamic_vocab_manager.slots[slot_idx]
+                        token_id = int(token_id_tensor.item())
+                        if token_id >= 0:  # Valid token (not -1 placeholder)
+                            reduced_idx = static_vocab_size + slot_idx
+                            self.draft_worker._static_vocab_inverse_map[token_id] = (
+                                reduced_idx
+                            )
+                    logger.info(
+                        f"Updated inverse_map for {lp.dynamic_vocab_manager.populated_size} tokens (capacity={lp.dynamic_vocab_manager.capacity})"
+                    )
+
+            return DynamicVocabAddReqOutput(slots=slots)
+
+        return DynamicVocabAddReqOutput(slots=[])
+
+        # We do not add to the main model because it usually has the full vocab.
+        # If we want to support adding to the main model, we can uncomment the following line.
+        # slots = self.tp_worker.dynamic_vocab_add(obj)
+
+        # return DynamicVocabAddReqOutput(slots=slots)
+
+    def dynamic_vocab_status(self, obj: DynamicVocabStatusReqInput):
+        # Prefer draft worker (dynamic vocab lives on draft); fall back to main if absent
+        if self.draft_worker is not None and hasattr(
+            self.draft_worker, "dynamic_vocab_status"
+        ):
+            status = self.draft_worker.dynamic_vocab_status(obj)
+        else:
+            status = self.tp_worker.dynamic_vocab_status(obj)
+
+        logger.info(f"Dynamic Vocab Status: {status}")
+        return DynamicVocabStatusReqOutput(status=status)
 
 
 class IdleSleeper:

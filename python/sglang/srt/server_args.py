@@ -389,6 +389,7 @@ class ServerArgs:
     speculative_use_static_vocab: bool = False
     speculative_static_vocab_ratio: float = 0.5
     speculative_static_vocab_path: Optional[str] = None
+    speculative_dynamic_vocab_capacity: Optional[int] = None
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -2784,6 +2785,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.speculative_static_vocab_path,
             help="Optional path to a newline-delimited list of token IDs to serve as the draft model's static vocabulary subset. Overrides the ratio when provided.",
+        )
+        parser.add_argument(
+            "--speculative-dynamic-vocab-capacity",
+            type=int,
+            default=ServerArgs.speculative_dynamic_vocab_capacity,
+            help="The capacity of the dynamic vocabulary for the draft model.",
         )
         # Ngram speculative decoding
         parser.add_argument(

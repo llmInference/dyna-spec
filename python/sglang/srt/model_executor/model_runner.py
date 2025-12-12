@@ -88,8 +88,13 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.io_struct import (
+    DynamicVocabAddReqInput,
+    DynamicVocabStatusReqInput,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -2020,7 +2025,7 @@ class ModelRunner:
             assert self.tp_size <= n_numa_node, (
                 f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
                 f"tp_size {self.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
-                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+                f"If you need tp_size to be larger than number of numa nodes, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
                 f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
                 f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
                 f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
@@ -2354,6 +2359,152 @@ class ModelRunner:
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+    def dynamic_vocab_add(self, req: DynamicVocabAddReqInput):
+        logger.info(
+            f"dynamic_vocab_add called on ModelRunner. is_draft_model={getattr(self.model_config, 'is_draft_model', False)}"
+        )
+        if not (
+            hasattr(self.model, "logits_processor")
+            and self.model.logits_processor.dynamic_vocab_manager is not None
+        ):
+            logger.warning(
+                "Dynamic vocabulary manager is not initialized. Ignoring dynamic_vocab_add request."
+            )
+            return []
+
+        logits_processor = self.model.logits_processor
+
+        # Filter out tokens already in static vocab
+        filtered_token_ids = []
+        filtered_weights = []
+
+        static_map = getattr(logits_processor, "_static_vocab_index_map", {}) or {}
+
+        # Build a set of static token ids from all known sources (not gated on a flag)
+        static_ids = set(static_map.keys())
+
+        static_ids.update(
+            getattr(logits_processor, "_static_vocab_indices_list", []) or []
+        )
+
+        buf = getattr(logits_processor, "_static_vocab_indices_host", None)
+        if buf is not None and hasattr(buf, "tolist"):
+            static_ids.update(buf.tolist())
+
+        if not static_ids:
+            logger.debug(
+                "dynamic_vocab_add: no static vocab indices found; skipping static-filter fallback"
+            )
+
+        for i, token_id in enumerate(req.new_token_ids):
+            if token_id in static_ids:
+                logger.info(
+                    "dynamic_vocab_add: skip token %s already in static vocab", token_id
+                )
+                continue
+            filtered_token_ids.append(token_id)
+            if req.new_weights is not None:
+                filtered_weights.append(req.new_weights[i])
+
+        if not filtered_token_ids:
+            return []
+
+        if req.new_weights is None:
+            # Extract weights from model.lm_head
+            if not hasattr(self.model, "lm_head"):
+                raise ValueError("Model does not have lm_head, cannot extract weights.")
+
+            lm_head = self.model.lm_head
+
+            if isinstance(lm_head, VocabParallelEmbedding):
+                hidden_dim = lm_head.embedding_dim
+            elif hasattr(lm_head, "weight"):
+                hidden_dim = lm_head.weight.shape[1]
+            else:
+                raise ValueError("Cannot determine hidden_dim from lm_head.")
+
+            local_new_weights = torch.zeros(
+                (len(filtered_token_ids), hidden_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            if isinstance(lm_head, VocabParallelEmbedding):
+                shard = lm_head.shard_indices
+                weight = lm_head.weight
+                base_offset = lm_head.num_org_embeddings_per_partition
+
+                for i, token_id in enumerate(filtered_token_ids):
+                    if (
+                        shard.org_vocab_start_index
+                        <= token_id
+                        < shard.org_vocab_end_index
+                    ):
+                        idx = token_id - shard.org_vocab_start_index
+                        local_new_weights[i] = weight[idx]
+                    elif (
+                        shard.added_vocab_start_index
+                        <= token_id
+                        < shard.added_vocab_end_index
+                    ):
+                        idx = base_offset + (token_id - shard.added_vocab_start_index)
+                        local_new_weights[i] = weight[idx]
+
+            elif hasattr(lm_head, "weight"):
+                weight = lm_head.weight
+                for i, token_id in enumerate(filtered_token_ids):
+                    if 0 <= token_id < weight.shape[0]:
+                        local_new_weights[i] = weight[token_id]
+
+            if dist.is_initialized():
+                dist.all_reduce(
+                    local_new_weights,
+                    op=dist.ReduceOp.SUM,
+                    group=get_tp_group().device_group,
+                )
+
+            new_weights_tensor = local_new_weights
+        else:
+            new_weights_tensor = torch.tensor(
+                filtered_weights, dtype=self.dtype, device=self.device
+            )
+
+        slots = logits_processor.dynamic_vocab_manager.add(filtered_token_ids)
+        logits_processor.dynamic_weights[slots] = new_weights_tensor.to(
+            logits_processor.dynamic_weights.dtype
+        )
+        logits_processor._dynamic_weights_populated = (
+            logits_processor.dynamic_vocab_manager.populated_size
+        )
+        return slots
+
+        return None
+
+    def dynamic_vocab_status(self, req: DynamicVocabStatusReqInput):
+        if hasattr(self.model, "logits_processor"):
+            lp = self.model.logits_processor
+            if lp.dynamic_vocab_manager is not None:
+                status = lp.dynamic_vocab_manager.get_status()
+                # Add lightweight debug info to help verify weights are populated
+                if lp.dynamic_weights is not None:
+                    populated = status.get("populated_size", 0)
+                    head = min(4, populated)
+                    if head > 0:
+                        weights_head = lp.dynamic_weights[:head]
+                        status["weights_head_norm"] = (
+                            weights_head.float().norm(dim=1).tolist()
+                        )
+                        status["weights_head_mean"] = (
+                            weights_head.float().mean(dim=1).tolist()
+                        )
+                return status
+            else:
+                return {
+                    "error": "dynamic_vocab_manager is None",
+                    "capacity": getattr(lp, "dynamic_vocab_capacity", "unknown"),
+                }
+        return {"error": "model has no logits_processor"}
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

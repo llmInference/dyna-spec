@@ -54,6 +54,10 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
+    DynamicVocabAddReqInput,
+    DynamicVocabAddReqOutput,
+    DynamicVocabStatusReqInput,
+    DynamicVocabStatusReqOutput,
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
@@ -334,6 +338,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
+        # Dynamic Vocab
+        self.dynamic_vocab_add_future = None
+        self.dynamic_vocab_status_future = None
+
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
@@ -394,6 +402,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
+                ),
+                (DynamicVocabAddReqOutput, self._handle_dynamic_vocab_add_req_output),
+                (
+                    DynamicVocabStatusReqOutput,
+                    self._handle_dynamic_vocab_status_req_output,
                 ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
@@ -1153,6 +1166,49 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         task_map[new_task] = gen
                     except StopAsyncIteration:
                         pass
+
+    async def dynamic_vocab_add(self, obj: DynamicVocabAddReqInput):
+        self.send_to_scheduler.send_pyobj(obj)
+
+        # Wait for response
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.dynamic_vocab_add_future = future
+        return await future
+
+    async def dynamic_vocab_status(self, obj: DynamicVocabStatusReqInput):
+        self.send_to_scheduler.send_pyobj(obj)
+
+        # Wait for response
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.dynamic_vocab_status_future = future
+
+        try:
+            result = await asyncio.wait_for(future, timeout=10.0)
+            return result
+        except asyncio.TimeoutError:
+            return {"error": "Timeout waiting for dynamic vocab status"}
+        finally:
+            self.dynamic_vocab_status_future = None
+
+    def _handle_dynamic_vocab_add_req_output(self, recv_obj: DynamicVocabAddReqOutput):
+        if (
+            hasattr(self, "dynamic_vocab_add_future")
+            and self.dynamic_vocab_add_future is not None
+        ):
+            if not self.dynamic_vocab_add_future.done():
+                self.dynamic_vocab_add_future.set_result(recv_obj.slots)
+
+    def _handle_dynamic_vocab_status_req_output(
+        self, recv_obj: DynamicVocabStatusReqOutput
+    ):
+        if (
+            hasattr(self, "dynamic_vocab_status_future")
+            and self.dynamic_vocab_status_future is not None
+        ):
+            if not self.dynamic_vocab_status_future.done():
+                self.dynamic_vocab_status_future.set_result(recv_obj.status)
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
@@ -1962,9 +2018,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to decode delimiter token {self.server_args.multi_item_scoring_delimiter}: {e}"
+                    f"Failed to initialize multi-item delimiter text from token ID {self.server_args.multi_item_scoring_delimiter}: {e}"
                 )
                 self.multi_item_delimiter_text = None
+        else:
+            self.multi_item_delimiter_text = None
 
     def _build_multi_item_token_sequence(
         self, query: List[int], items: List[List[int]], delimiter_token_id: int

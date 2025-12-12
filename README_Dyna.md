@@ -574,6 +574,74 @@ def inference_step(...):
 
 ---
 
+#### **固定容量动态词汇表（Dynamic Vocab）规范**
+
+目的：在保留静态基础子词表的前提下，允许在运行时向草稿模型动态加入新的原始词元 ID，从而捕获低频或上下文特定的新词，同时保持 LM-head 计算按需受限以节约算力。
+
+- **参数定义**：
+    - **`dynamic_vocab_capacity`（必需，整型）**：为动态扩展区域预分配的固定槽位数量（capacity）。容量在模型加载/CUDA-graph capture 时为常量，以保证图捕获期间张量形状固定。
+    - **`dynamic_vocab_populated_size`（运行时，可变，整型标量）**：当前实际被填充的槽位数量 N，满足 0 <= N <= `dynamic_vocab_capacity`。
+
+- **运行时 API（建议）**：
+    - `POST /dynamic_vocab/add`  或内部 RPC `dynamic_vocab.add(token_id:int) -> {slot:int, evicted_token:int|null}`
+        - 将原始全量词表的 `token_id` 插入到动态槽中，返回分配的槽索引 `slot`（0..capacity-1）以及被替换（若触发 ARC 回收）的 `evicted_token`。
+    - `GET /dynamic_vocab/status` -> `{capacity:int, populated_size:int, mapping: [{slot:int, token_id:int|null}]}`
+
+- **管理策略**：
+    - 推荐使用 **ARC（Adaptive Replacement Cache）** 作为替换策略，以在频率与最近性之间取得平衡。
+    - 系统需维护两张映射表：
+        - `slot -> original_token_id`（长度 = `dynamic_vocab_capacity`），空槽以 `-1` 或 `null` 表示；
+        - `original_token_id -> slot`（哈希表），用于快速查找某 token 是否已经驻留在某槽位。
+
+- **运行时/计算约定**：
+    - 为兼容 CUDA Graph（capture 期间张量形状固定）的限制，所有与动态区域交互的算子在张量维度上必须使用固定的 `dynamic_vocab_capacity` 作为列维度（即输出形状关于列维为常量）。
+    - 但算子应在内部只对前 `dynamic_vocab_populated_size` 列执行实际计算（例如矩阵乘法仅遍历或加载这 N 列），其余列可以保持零值或被掩码（mask）掉，从而在 API 层面实现“按需计算”。
+    - 下游采样/映射逻辑应接收两个并行结果：
+        - 动态 logits（形状固定为 `[B, T, dynamic_vocab_capacity]`），实际有效值仅在前 N 列；
+        - 对应的 `slot -> original_token_id` 数组（长度 = `dynamic_vocab_capacity`）。
+    - 推荐算子接口返回同时包括 `populated_size`（标量）以避免二义性。
+
+- **Triton 自定义算子（建议设计）**：
+    - 目标：实现一个高效的 GPU 内核，仅对前 N 列执行 lm-head 的列向量点积/矩阵乘，避免对未填充槽位浪费计算。该算子需要：
+        - 输入：`hidden_states`（float32/float16，形状 `[B, T, H]`）、`lm_head_dynamic_weights`（形状 `[dynamic_vocab_capacity, H]` 或以连续内存存储的指针）、`populated_size`（int32 标量）、`slot_mask`（可选，布尔向量长度 = capacity）
+        - 输出：`dynamic_logits`（形状 `[B, T, dynamic_vocab_capacity]`，其中列 index >= populated_size 可以为任意值但应被下游掩码或置为一个极小值）
+        - 行为：kernel 在内部仅对列索引 `0..populated_size-1` 做 dot(hidden, weight[col])；对于剩余列跳过计算（或写入数值为 -inf/极小以便采样忽略）。
+    - 性能要点：
+        - 内核应避免在 CUDA-graph capture 后改变内存布局或张量形状；通过接受固定的 `capacity` 但在循环中读取 `populated_size` 控制实际工作量来满足这一点。
+        - 可以在 Triton 中实现为按列分块（block-column）遍历，但在每个块内部仅处理有效列数；当 `populated_size` 很小时，内核的分支与内存加载应尽量减少无用加载。
+        - 为降低内存带宽，建议将动态权重按 slot-blocks 组织（例如每个 block 包含 32/64 个列），并在内核中对完整块使用向量化加载，当块完全超出 `populated_size` 时直接跳过。
+
+- **与静态子词表的协同**：
+    - 草稿模型最终的 logits 可由两部分组合得到：`static_logits`（来自静态子词表，按已有实现通过 index_select 获得）和 `dynamic_logits`（来自 Triton kernel）；
+    - 在采样前，系统需要把动态槽位的列索引映射回原始 token id：`reduced_index -> original_token_id`，并写入验证日志中的 `draft_generated_reduced_ids` 与 `draft_generated_original_ids`。
+
+- **可测性与回归测试**：
+    - 单元测试：验证 `add(token_id)` 后 `slot -> token_id` 与反向映射正确，且在 `populated_size` 变化时 Triton/kernel 只对前 N 列产生非零 logits。
+    - 性能测试：对比在不同 `populated_size`（0、1、N/2、capacity）下的 GPU 时间，确保当 N<<capacity 时算子能节省大量计算与内存带宽。
+
+- **技术背景：为什么必须设计自定义算子？**
+  现有的标准算子（如 PyTorch 的 `torch.matmul` 或 `F.linear`）无法做到“只对前 N 列执行实际计算”且兼容 CUDA Graph。
+  1. **标准算子的“傻瓜”行为**：
+     - 直接使用 `torch.matmul(input, weight)` 会严格按照 weight 的形状计算。即使后半部分全是 0 (Padding)，算子依然会执行乘法和加法。
+     - **后果**：计算量未减，带宽浪费（读取无用权重）。
+  2. **“按需计算”即新算子**：
+     - 目标逻辑：内部只对前 `dynamic_vocab_populated_size` 列执行实际计算，其余列保持零值。
+     - 现状：PyTorch/CUDA 标准库不存在 `matmul_with_early_exit` 能够动态跳过计算。
+  3. **常规替代方案的缺陷**：
+     - **切片（Slicing）**：`output = torch.matmul(input, weight[:, :actual_size])`
+       - **后果**：改变 Tensor Shape -> **CUDA Graph 报错**（Graph 捕获时锁定 Shape 和内存地址）。
+     - **掩码（Masking）**：全量计算 `output = torch.matmul(...)` 后再 `output[:, actual_size:] = 0`
+       - **后果**：结果正确，但**速度最慢**（全量计算 + 额外抹零开销）。
+
+  因此，必须使用 Triton 实现自定义算子，在内核内部根据 `populated_size` 动态控制循环边界，从而在保持 Tensor Shape 不变（兼容 CUDA Graph）的前提下真正节省算力。
+
+此规范旨在为运行时动态扩展词汇表提供清晰的接口与实现约束，同时兼顾 CUDA-graph 的形状固定限制与实际计算节省需求。后续若要实现该功能，下一步应产出：
+
+- Triton 内核的原型实现（含基线性能基准）
+- 动态词汇 API（服务端/内部 RPC）的轻量参考实现
+- 单元/性能测试和示例场景（如对话系统在流式新词加入时的表现）
+
+
 #### **4. 总结与后续工作**
 
 本文档详细描述了为 SGlang 实现三阶段词汇表优化功能的开发流程。按照这个指南，您可以逐步构建一个功能完善、模块化且可扩展的系统。

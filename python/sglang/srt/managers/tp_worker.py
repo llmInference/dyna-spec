@@ -24,6 +24,8 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
+    DynamicVocabAddReqInput,
+    DynamicVocabStatusReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -452,3 +454,9 @@ class TpModelWorker(BaseTpWorker):
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result
+
+    def dynamic_vocab_add(self, req: DynamicVocabAddReqInput):
+        return self.model_runner.dynamic_vocab_add(req)
+
+    def dynamic_vocab_status(self, req: DynamicVocabStatusReqInput):
+        return self.model_runner.dynamic_vocab_status(req)

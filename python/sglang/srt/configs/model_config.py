@@ -100,6 +100,7 @@ class ModelConfig:
         use_static_vocab: bool = False,
         static_vocab_ratio: float = 1.0,
         custom_vocab_path: Optional[str] = None,
+        dynamic_vocab_capacity: Optional[int] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -110,6 +111,7 @@ class ModelConfig:
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
         self.custom_vocab_path = custom_vocab_path
+        self.dynamic_vocab_capacity = dynamic_vocab_capacity
         requested_use_static_vocab = use_static_vocab
         requested_static_vocab_ratio = static_vocab_ratio
 
@@ -213,6 +215,13 @@ class ModelConfig:
         )
         self.hf_config.static_vocab_path = self.static_vocab_path
 
+        # Set dynamic vocabulary capacity on hf_config for draft models
+        if self.dynamic_vocab_capacity is not None:
+            self.hf_config.dynamic_vocab_capacity = self.dynamic_vocab_capacity
+            logger.info(
+                f"ModelConfig: Set hf_config.dynamic_vocab_capacity = {self.dynamic_vocab_capacity}"
+            )
+
         # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -302,10 +311,17 @@ class ModelConfig:
             kwargs.setdefault(
                 "custom_vocab_path", server_args.speculative_static_vocab_path
             )
+            kwargs.setdefault(
+                "dynamic_vocab_capacity", server_args.speculative_dynamic_vocab_capacity
+            )
+            logger.info(
+                f"ModelConfig.from_server_args: is_draft_model=True, dynamic_vocab_capacity={kwargs.get('dynamic_vocab_capacity')}"
+            )
         else:
             kwargs.setdefault("use_static_vocab", False)
             kwargs.setdefault("static_vocab_ratio", 1.0)
             kwargs.setdefault("custom_vocab_path", None)
+            kwargs.setdefault("dynamic_vocab_capacity", None)
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,

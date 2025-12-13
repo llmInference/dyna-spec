@@ -2,9 +2,33 @@ import logging
 from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
+import threading
 
 import torch
 import torch.nn.functional as F
+
+# for queries: begin
+
+import sys
+import os
+import numpy as np
+import bisect
+import requests
+import json
+
+project_root = os.path.join(os.path.dirname(__file__), '../../../..')
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+from queries.query_hnsw import get_hnsw_similar_words
+from queries.query_graph import get_co_occurrence
+
+lookup = np.load(project_root + "/queries/generated/lookup.npy") # token_id -> token
+
+with open(project_root + "/queries/assets/custom_static_vocab.txt") as f:
+    static_vocab = [int(line.strip()) for line in f]
+
+# for queries: end
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -18,7 +42,7 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
@@ -188,6 +212,189 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    def _print_verification_details(
+        self,
+        batch: ScheduleBatch,
+        candidates: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        predict: torch.Tensor,
+        target_probs: Optional[torch.Tensor] = None,
+        prev_output_ids_list: Optional[List[List[int]]] = None,
+    ):
+        """Print detailed verification information for each request."""
+        bs = candidates.shape[0]
+        accept_index_cpu = accept_index.cpu().tolist()
+        accept_length_cpu = accept_length.cpu().tolist()
+
+        for i, req in enumerate(batch.reqs):
+            if i >= bs:
+                break
+                
+            # Get tokenizer if available
+            tokenizer = getattr(req, 'tokenizer', None)
+            if tokenizer is None:
+                tokenizer = getattr(batch, 'tokenizer', None)
+            
+            # Get previous outputs (before this verification round)
+            if prev_output_ids_list is not None and i < len(prev_output_ids_list):
+                prev_output_ids = prev_output_ids_list[i]
+            else:
+                # Fallback: try to get from req.output_ids
+                num_new_tokens = accept_length_cpu[i] + 1  # +1 for bonus token
+                prev_output_ids = req.output_ids[:-num_new_tokens] if len(req.output_ids) > num_new_tokens else []
+            context_text = ""
+            if tokenizer is not None and len(prev_output_ids) > 0:
+                try:
+                    # Get last 20 tokens for better context
+                    context_tokens = prev_output_ids[-20:] if len(prev_output_ids) >= 20 else prev_output_ids
+                    context_text = tokenizer.decode(context_tokens)
+                except Exception as e:
+                    context_text = f"Token IDs: {prev_output_ids[-10:] if prev_output_ids else []}"
+            else:
+                context_text = f"Token IDs: {prev_output_ids[-10:] if prev_output_ids else []}"
+            
+            # Calculate rejection layer
+            accept_row = accept_index_cpu[i]
+            rejection_layer = -1
+            
+            # Find the first rejected position (first -1)
+            for j in range(len(accept_row)):
+                if accept_row[j] == -1:
+                    rejection_layer = j
+                    break
+            
+            if rejection_layer == -1:
+                rejection_layer = self.draft_token_num
+            
+            if rejection_layer < self.draft_token_num:
+                print(f"❌ Draft Failed at Layer {rejection_layer}.")
+                # Invoke handler to add words asynchronously
+                def run_handle_failure():
+                    try:
+                        self._handle_failure(
+                            batch=batch,
+                            req_index=i,
+                            rejection_layer=rejection_layer,
+                            candidates=candidates,
+                            target_probs=target_probs,
+                            accept_index=accept_index,
+                            predict=predict,
+                        )
+                    except Exception as e:
+                        logger.exception(f"Error in async failure handling: {e}")
+                thread = threading.Thread(target=run_handle_failure, daemon=True)
+                thread.start()
+            else:
+                print(f"✅ Draft Accepted All {self.draft_token_num} Tokens.")
+
+    def _handle_failure(
+        self,
+        batch: ScheduleBatch,
+        req_index: int,
+        rejection_layer: int,
+        candidates: torch.Tensor,
+        target_probs: Optional[torch.Tensor] = None,
+        accept_index: Optional[torch.Tensor] = None,
+        predict: Optional[torch.Tensor] = None,
+    ):
+        print("✨ Handle Failure Started")
+        """Handle failure analysis for a specific request.
+        
+        Args:
+            batch: The schedule batch
+            req_index: Index of the request in the batch
+            rejection_layer: The layer where draft failed (0-indexed)
+            candidates: Draft tokens (bs, draft_token_num)
+            target_probs: Target model probabilities (bs, draft_token_num, vocab_size)
+            accept_index: Accepted indices (bs, spec_steps+1)
+            predict: Target model predictions (flat tensor)
+        """
+
+
+        # 0. judge!
+        accepted_id = -1
+        if predict != None:
+            draft_pos = rejection_layer - 1
+            if draft_pos < self.draft_token_num:
+                idx = self.retrive_index[req_index, draft_pos]
+                if idx >= 0 and idx < len(predict):
+                    accepted_id = predict[idx].item()   # 不知道accepted_id获取对了没
+
+        if accepted_id != -1:
+            idx = bisect.bisect_left(static_vocab, accepted_id)
+            if (idx < len(static_vocab) and static_vocab[idx] == accepted_id):
+                print(f"✨ Accepted token '{lookup[accepted_id]}' is already in static vocab. Skip.")
+                # 如果正确答案已经在精简词汇表里了，说明是小模型自己能力差没猜到，就不加词了
+                return
+
+        
+        # 1. Get top_k
+        print("✨ Getting top_k & last_hidden_state...")
+        top_k = []
+        if target_probs is not None and rejection_layer < self.draft_token_num:
+            # target_probs shape: (bs, draft_token_num, vocab_size)
+            probs_at_failure = target_probs[req_index, rejection_layer]
+            
+            # Get top-k probabilities and token ids
+            topk = min(self.topk, probs_at_failure.shape[-1])
+            top_probs, top_token_ids = torch.topk(probs_at_failure, k=topk)
+            
+            # print(f"\nTop-{topk} tokens from Target Model at failure layer {rejection_layer}:")
+            for k in range(topk):
+                token_id = top_token_ids[k].item()
+                top_k.append(token_id)
+
+        for i in range(len(top_k)-1, 0, -1): # remove those in static vocab
+            idx = bisect.bisect_left(static_vocab, top_k[i])
+            if (idx < len(static_vocab) and static_vocab[idx] == accepted_id):
+                del top_k[i]
+
+        # 2. Get last hidden state
+        if hasattr(batch, 'spec_info') and hasattr(batch.spec_info, 'hidden_states'):
+            hidden_states = batch.spec_info.hidden_states
+
+            if rejection_layer < self.draft_token_num:
+                flat_index = req_index * self.draft_token_num + rejection_layer
+                if flat_index < hidden_states.shape[0]:
+                    last_hidden_state = hidden_states[flat_index].float().cpu().numpy()
+
+                else:
+                    print(f"\nHidden State not available at index {flat_index}")
+            else:
+                print(f"\nHidden State: rejection_layer {rejection_layer} >= draft_token_num {self.draft_token_num}")
+        else:
+            print(f"\nHidden State not available in batch.spec_info")
+
+
+        # 3. Query and get C_final
+        hnsw_result = get_hnsw_similar_words(last_hidden_state, 10)
+
+        C_initial = list(set(top_k + hnsw_result))
+        print("🔵 C_initial:")
+        print(C_initial)
+
+        C_co_occurrence = []
+        for token in C_initial:
+            C_co_occurrence.extend(get_co_occurrence(token))
+        
+        print(f"✨ HNSW Result: {len(hnsw_result)} tokens; C_co_occurrence: {len(C_co_occurrence)} tokens")
+        
+        C_final = [int(idx) for idx in list(set(C_initial + C_co_occurrence))]
+
+
+        # 4. Add to dyna vocab
+        url = "http://localhost:30000/dynamic_vocab/add"
+        headers = {"Content-Type": "application/json"}
+        C_final_words = [lookup[idx] for idx in C_final] # only for debug output
+        data = {"vocab_size": 151936, "new_token_ids": C_final}
+
+        print("✨ Adding words to dyna vocab: [" + ", ".join(C_final_words) + "]")
+        
+        # 有一些词可能会被重复添加，不过为了性能考虑，就不做判断了
+        response = requests.post(url, headers=headers, json=data)
+        
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -207,6 +414,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
+            return EagleVerifyOutput(
+                draft_input=EagleDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=batch.model_config.hidden_size,
+                    dtype=batch.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                ),
+                logits_output=logits_output,
+                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                accept_length_per_req_cpu=[],
+                accepted_indices=torch.full(
+                    (0, self.spec_steps + 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=batch.device,
+                ),
+            )
+        
+        # Skip verification in prefill-only phase
+        # Speculative decoding should only happen in decode phase, not in prefill phase
+        is_prefill_only = getattr(batch, 'is_prefill_only', False)
+        if is_prefill_only and batch.forward_mode.is_extend():
+            # This is a prefill-only batch, should not perform speculative decoding
+            logger.warning(
+                "Attempted to verify in prefill-only phase. "
+                "Speculative decoding should only occur in decode phase. "
+                "Skipping verification."
+            )
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
@@ -282,6 +518,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
+        target_probs_for_log = None
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
@@ -296,6 +533,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
+            # Compute probabilities for logging in greedy case
+            target_logits_reshaped = logits_output.next_token_logits.reshape(bs, self.draft_token_num, -1)
+            target_probs_for_log = F.softmax(target_logits_reshaped, dim=-1)
 
         else:
             # apply temperature and get target probs
@@ -320,6 +560,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     ),
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
+            target_probs_for_log = target_probs
 
             draft_probs = torch.zeros(
                 target_probs.shape, dtype=torch.float32, device=batch.device
@@ -366,6 +607,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         predict_cpu = predict.tolist()
         has_finished = False
 
+        # Save output_ids before modification for logging
+        prev_output_ids_list = [list(req.output_ids) for req in batch.reqs]
+
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
@@ -402,6 +646,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
+
+        # Save accept_index before it gets modified
+        accept_index_for_log = accept_index.clone()
+
+        # Print detailed verification information for each request
+        # Only print in decode phase, not in prefill phase
+        # Check if this is a decode phase (not prefill-only)
+        # Skip printing if this is a prefill-only batch
+        is_prefill_only = getattr(batch, 'is_prefill_only', False)
+        is_decode_phase = (
+            not batch.forward_mode.is_idle()
+            and not is_prefill_only
+            and (
+                batch.forward_mode.is_decode()
+                or batch.forward_mode == ForwardMode.TARGET_VERIFY
+                or (hasattr(batch, 'forward_mode') and not batch.forward_mode.is_extend())
+            )
+        )
+        
+        if is_decode_phase:
+            self._print_verification_details(
+                batch=batch,
+                candidates=candidates,
+                accept_index=accept_index_for_log,
+                accept_length=accept_length,
+                predict=predict,
+                target_probs=target_probs_for_log,
+                prev_output_ids_list=prev_output_ids_list,
+            )
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
